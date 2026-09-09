@@ -3,6 +3,7 @@ ADMIN_PASSWORD=changeme123
 SESSION_SECRET=please-change-this-to-a-long-random-string
 
 # Cap Standalone（三项都填才会启用登录/注册验证码）
+# 线上请在 Dashboard Variables 填写 CAP_URL / CAP_SITE_KEY，不要写进 wrangler.jsonc。
 # CAP_URL=https://cap.example.com
 # CAP_SITE_KEY=
 # CAP_SECRET_KEY=

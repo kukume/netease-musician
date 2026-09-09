@@ -50,7 +50,7 @@ npx wrangler secret put ADMIN_PASSWORD
 npx wrangler secret put SESSION_SECRET
 ```
 
-也可在 `wrangler.jsonc` 的 `vars` 或 Dashboard 里放非敏感的 `ADMIN_USERNAME`。启用 Cap 时再加上 `CAP_URL`、`CAP_SITE_KEY`，私钥用 `npx wrangler secret put CAP_SECRET_KEY`。
+也可在 Dashboard 的 Variables 里放非敏感的 `ADMIN_USERNAME`。**不要**把 `CAP_URL` / `CAP_SITE_KEY` 写进 `wrangler.jsonc` 的 `vars`：即便是空字符串，每次部署也会覆盖 Dashboard 里的值。启用 Cap 时在 Dashboard 填写 `CAP_URL`、`CAP_SITE_KEY`，私钥用 `npx wrangler secret put CAP_SECRET_KEY`。本仓库已开启 `keep_vars`，Dashboard 明文变量不会被部署清掉。
 
 ### Cap 验证码
 
