@@ -18,8 +18,6 @@ const SCATTER_MAX_SEC = 240;
 const WORK_LOCK_KEY = "listen_work";
 const WORK_LOCK_IDLE = '{"owner":"","phase":"idle","refs":0,"expiresAt":0}';
 const WORK_LOCK_TTL_SEC = 10 * 60;
-const WORK_WAIT_MAX_MS = 10 * 60 * 1000;
-const WORK_POLL_MS = 2_000;
 
 function randInt(min: number, max: number): number {
   const span = max - min + 1;
@@ -129,27 +127,14 @@ async function releaseWork(env: Env, owner: string): Promise<void> {
     .run();
 }
 
-async function waitAndAcquireWork(env: Env, owner: string, phase: WorkPhase): Promise<void> {
-  const started = Date.now();
-  let waiting = false;
-  while (!(await tryAcquireWork(env, owner, phase))) {
-    if (Date.now() - started >= WORK_WAIT_MAX_MS) {
-      listenLog("work.steal", `owner=${owner.slice(0, 8)} phase=${phase} waited=${Math.round(WORK_WAIT_MAX_MS / 1000)}s`);
-      await env.DB.prepare("UPDATE site_settings SET value = ? WHERE key = ?").bind(WORK_LOCK_IDLE, WORK_LOCK_KEY).run();
-      if (await tryAcquireWork(env, owner, phase)) return;
-      throw new Error("听歌工作锁等待超时");
-    }
-    const lock = await readWorkLock(env);
-    if (!waiting) {
-      listenLog("work.wait", `busy=${lock.phase || "unknown"} 上一次还在下载或上报，卡住等待`);
-      waiting = true;
-    }
-    await sleep(WORK_POLL_MS);
+async function acquireWorkOrSkip(env: Env, owner: string, phase: WorkPhase): Promise<boolean> {
+  if (await tryAcquireWork(env, owner, phase)) {
+    listenLog("work.hold", `owner=${owner.slice(0, 8)} phase=${phase}`);
+    return true;
   }
-  listenLog(
-    waiting ? "work.acquired" : "work.hold",
-    `owner=${owner.slice(0, 8)} phase=${phase}${waiting ? ` waited=${Math.round((Date.now() - started) / 1000)}s` : ""}`,
-  );
+  const lock = await readWorkLock(env);
+  listenLog("work.skip", `busy=${lock.phase || "unknown"} 上一次还在下载或上报，本分钟退出`);
+  return false;
 }
 
 type AccountRow = {
@@ -366,7 +351,7 @@ function schedulePlayReport(
     try {
       await sleep(waitMs);
       listenLog("wait.play.due", `${who(account)} 等待结束，开始上报 play`);
-      await waitAndAcquireWork(env, owner, "report");
+      if (!(await acquireWorkOrSkip(env, owner, "report"))) return;
       try {
         await reportOne(env, account.id);
       } finally {
@@ -541,7 +526,9 @@ export async function tickListen(env: Env, ctx?: ExecutionContext): Promise<{
   }
 
   const owner = newId();
-  await waitAndAcquireWork(env, owner, "tick");
+  if (!(await acquireWorkOrSkip(env, owner, "tick"))) {
+    return { skipped: "上一次还在下载或上报", reported: 0, started: 0, success: 0, fail: 0 };
+  }
   try {
     listenLog(
       "tick.begin",
