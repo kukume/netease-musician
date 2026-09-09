@@ -41,7 +41,7 @@ function publicUser(u: User) {
   return { id: u.id, username: u.username, role: u.role, status: u.status, createdAt: u.created_at };
 }
 
-export async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+export async function handleApi(request: Request, env: Env): Promise<Response> {
   await bootstrapAdmin(env);
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/";
@@ -86,7 +86,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     if (method === "PUT" && path === "/api/admin/playlist") return setPlaylist(env, request);
     if (method === "POST" && path === "/api/admin/playlist/refresh") return refreshPlaylist(env, request);
     if (method === "PUT" && path === "/api/admin/listen") return setListen(env, request);
-    if (method === "POST" && path === "/api/admin/listen/run") return manualListen(env, request, ctx);
+    if (method === "POST" && path === "/api/admin/listen/run") return manualListen(env, request);
     if (method === "GET" && path === "/api/admin/logs") return adminLogs(env, request);
 
     return err("接口不存在", 404);
@@ -510,10 +510,10 @@ async function setListen(env: Env, request: Request) {
   return ok({ listenEnabled: !!body.enabled });
 }
 
-async function manualListen(env: Env, request: Request, ctx: ExecutionContext) {
+async function manualListen(env: Env, request: Request) {
   const admin = await requireAdmin(env, request);
   if (admin instanceof Response) return admin;
-  const result = await kickListen(env, ctx);
+  const result = await kickListen(env);
   return ok(result);
 }
 
