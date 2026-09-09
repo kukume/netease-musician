@@ -15,6 +15,11 @@ const MAX_REPORTS_PER_TICK = 40;
 const GAP_MIN_SEC = 40;
 const GAP_MAX_SEC = 180;
 const SCATTER_MAX_SEC = 240;
+const WORK_LOCK_KEY = "listen_work";
+const WORK_LOCK_IDLE = '{"owner":"","phase":"idle","refs":0,"expiresAt":0}';
+const WORK_LOCK_TTL_SEC = 10 * 60;
+const WORK_WAIT_MAX_MS = 10 * 60 * 1000;
+const WORK_POLL_MS = 2_000;
 
 function randInt(min: number, max: number): number {
   const span = max - min + 1;
@@ -48,6 +53,103 @@ async function sleep(ms: number): Promise<void> {
     else await new Promise((resolve) => setTimeout(resolve, step));
     left -= step;
   }
+}
+
+type WorkPhase = "tick" | "report";
+
+type WorkLock = {
+  owner: string;
+  phase: string;
+  refs: number;
+  expiresAt: number;
+};
+
+async function ensureWorkLockRow(env: Env) {
+  await env.DB.prepare("INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)").bind(WORK_LOCK_KEY, WORK_LOCK_IDLE).run();
+}
+
+async function readWorkLock(env: Env): Promise<WorkLock> {
+  const row = await env.DB.prepare("SELECT value FROM site_settings WHERE key = ?").bind(WORK_LOCK_KEY).first<{ value: string }>();
+  try {
+    const value = JSON.parse(row?.value || WORK_LOCK_IDLE) as Partial<WorkLock>;
+    return {
+      owner: String(value.owner || ""),
+      phase: String(value.phase || "idle"),
+      refs: Number(value.refs || 0),
+      expiresAt: Number(value.expiresAt || 0),
+    };
+  } catch {
+    return { owner: "", phase: "idle", refs: 0, expiresAt: 0 };
+  }
+}
+
+async function tryAcquireWork(env: Env, owner: string, phase: WorkPhase): Promise<boolean> {
+  await ensureWorkLockRow(env);
+  const now = nowSec();
+  const expires = now + WORK_LOCK_TTL_SEC;
+  const result = await env.DB.prepare(
+    `UPDATE site_settings
+     SET value = json_object(
+       'owner', ?,
+       'phase', ?,
+       'refs', CASE
+         WHEN coalesce(json_extract(value, '$.owner'), '') = ? AND coalesce(json_extract(value, '$.refs'), 0) > 0
+         THEN coalesce(json_extract(value, '$.refs'), 0) + 1
+         ELSE 1
+       END,
+       'expiresAt', ?
+     )
+     WHERE key = ?
+     AND (
+       coalesce(json_extract(value, '$.refs'), 0) <= 0
+       OR coalesce(json_extract(value, '$.expiresAt'), 0) <= ?
+       OR coalesce(json_extract(value, '$.owner'), '') = ?
+     )`,
+  )
+    .bind(owner, phase, owner, expires, WORK_LOCK_KEY, now, owner)
+    .run();
+  return Number(result.meta.changes || 0) > 0;
+}
+
+async function releaseWork(env: Env, owner: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE site_settings
+     SET value = CASE
+       WHEN coalesce(json_extract(value, '$.refs'), 0) <= 1 THEN ?
+       ELSE json_object(
+         'owner', json_extract(value, '$.owner'),
+         'phase', json_extract(value, '$.phase'),
+         'refs', coalesce(json_extract(value, '$.refs'), 1) - 1,
+         'expiresAt', json_extract(value, '$.expiresAt')
+       )
+     END
+     WHERE key = ? AND coalesce(json_extract(value, '$.owner'), '') = ?`,
+  )
+    .bind(WORK_LOCK_IDLE, WORK_LOCK_KEY, owner)
+    .run();
+}
+
+async function waitAndAcquireWork(env: Env, owner: string, phase: WorkPhase): Promise<void> {
+  const started = Date.now();
+  let waiting = false;
+  while (!(await tryAcquireWork(env, owner, phase))) {
+    if (Date.now() - started >= WORK_WAIT_MAX_MS) {
+      listenLog("work.steal", `owner=${owner.slice(0, 8)} phase=${phase} waited=${Math.round(WORK_WAIT_MAX_MS / 1000)}s`);
+      await env.DB.prepare("UPDATE site_settings SET value = ? WHERE key = ?").bind(WORK_LOCK_IDLE, WORK_LOCK_KEY).run();
+      if (await tryAcquireWork(env, owner, phase)) return;
+      throw new Error("听歌工作锁等待超时");
+    }
+    const lock = await readWorkLock(env);
+    if (!waiting) {
+      listenLog("work.wait", `busy=${lock.phase || "unknown"} 上一次还在下载或上报，卡住等待`);
+      waiting = true;
+    }
+    await sleep(WORK_POLL_MS);
+  }
+  listenLog(
+    waiting ? "work.acquired" : "work.hold",
+    `owner=${owner.slice(0, 8)} phase=${phase}${waiting ? ` waited=${Math.round((Date.now() - started) / 1000)}s` : ""}`,
+  );
 }
 
 type AccountRow = {
@@ -256,6 +358,7 @@ function schedulePlayReport(
   ctx: ExecutionContext | undefined,
   account: { id: string; nickname?: string | null },
   reportAt: number,
+  owner: string,
 ) {
   const waitMs = Math.max(0, reportAt * 1000 - Date.now());
   listenLog("wait.play", `${who(account)} 模拟听歌 ${Math.round(waitMs / 1000)}s，到点后会打 report.start / weblog.play`);
@@ -263,7 +366,12 @@ function schedulePlayReport(
     try {
       await sleep(waitMs);
       listenLog("wait.play.due", `${who(account)} 等待结束，开始上报 play`);
-      await reportOne(env, account.id);
+      await waitAndAcquireWork(env, owner, "report");
+      try {
+        await reportOne(env, account.id);
+      } finally {
+        await releaseWork(env, owner);
+      }
     } catch (e) {
       listenLog("wait.play.fail", `${who(account)} ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -298,6 +406,7 @@ async function startDueAccounts(
   playlistId: string,
   trackCount: number,
   ctx?: ExecutionContext,
+  owner?: string,
 ): Promise<{ started: number; fail: number }> {
   const now = nowSec();
   await env.DB.prepare(
@@ -405,7 +514,7 @@ async function startDueAccounts(
         "start.ok",
         `${who(account)} duration=${Math.round(durationS)}s reportAt=${new Date(reportAt * 1000).toISOString()} gap=${gap}s`,
       );
-      schedulePlayReport(env, ctx, account, reportAt);
+      schedulePlayReport(env, ctx, account, reportAt, owner || newId());
     } catch (e) {
       fail += 1;
       const expired = e instanceof CookieExpiredError;
@@ -431,40 +540,47 @@ export async function tickListen(env: Env, ctx?: ExecutionContext): Promise<{
     return { skipped: "尚未初始化", reported: 0, started: 0, success: 0, fail: 0 };
   }
 
-  listenLog(
-    "tick.begin",
-    `enabled=${!!meta.listen_enabled} playlist=${meta.playlist_id || "-"} tracks=${meta.track_count || 0}`,
-  );
-  const reports = await finishDueReports(env);
-  if (!meta.listen_enabled) {
-    await trimLogs(env);
-    listenLog("tick.done", `听歌已关闭 reported=${reports.success + reports.fail} success=${reports.success} fail=${reports.fail}`);
-    return {
-      skipped: "互助听歌已关闭（已结算进行中的上报）",
-      reported: reports.success + reports.fail,
-      started: 0,
-      success: reports.success,
-      fail: reports.fail,
-    };
-  }
-  if (!meta.playlist_id || !meta.track_count) {
-    await trimLogs(env);
-    listenLog("tick.skip", "尚未设置歌单");
-    return { skipped: "尚未设置歌单", reported: reports.success + reports.fail, started: 0, success: reports.success, fail: reports.fail };
-  }
+  const owner = newId();
+  await waitAndAcquireWork(env, owner, "tick");
+  try {
+    listenLog(
+      "tick.begin",
+      `enabled=${!!meta.listen_enabled} playlist=${meta.playlist_id || "-"} tracks=${meta.track_count || 0}`,
+    );
+    const reports = await finishDueReports(env);
+    if (!meta.listen_enabled) {
+      await trimLogs(env);
+      listenLog("tick.done", `听歌已关闭 reported=${reports.success + reports.fail} success=${reports.success} fail=${reports.fail}`);
+      return {
+        skipped: "互助听歌已关闭（已结算进行中的上报）",
+        reported: reports.success + reports.fail,
+        started: 0,
+        success: reports.success,
+        fail: reports.fail,
+      };
+    }
+    if (!meta.playlist_id || !meta.track_count) {
+      await trimLogs(env);
+      listenLog("tick.skip", "尚未设置歌单");
+      return { skipped: "尚未设置歌单", reported: reports.success + reports.fail, started: 0, success: reports.success, fail: reports.fail };
+    }
 
-  const starts = await startDueAccounts(env, meta.playlist_id, meta.track_count, ctx);
-  await trimLogs(env);
-  listenLog(
-    "tick.done",
-    `started=${starts.started} reported=${reports.success + reports.fail} success=${reports.success} fail=${reports.fail + starts.fail}`,
-  );
-  return {
-    reported: reports.success + reports.fail,
-    started: starts.started,
-    success: reports.success,
-    fail: reports.fail + starts.fail,
-  };
+    const starts = await startDueAccounts(env, meta.playlist_id, meta.track_count, ctx, owner);
+    await trimLogs(env);
+    listenLog(
+      "tick.done",
+      `started=${starts.started} reported=${reports.success + reports.fail} success=${reports.success} fail=${reports.fail + starts.fail}`,
+    );
+    return {
+      reported: reports.success + reports.fail,
+      started: starts.started,
+      success: reports.success,
+      fail: reports.fail + starts.fail,
+    };
+  } finally {
+    await releaseWork(env, owner);
+    listenLog("work.release", `owner=${owner.slice(0, 8)} 进入等待或不忙`);
+  }
 }
 
 export async function kickListen(env: Env, ctx?: ExecutionContext): Promise<{
