@@ -388,7 +388,7 @@ export async function fetchPublicPlaylist(playlistId: string): Promise<PlaylistI
 
 const AUDIO_PAGE_BYTES = 256 * 1024;
 const AUDIO_PAGE_TIMEOUT_MS = 20_000;
-const AUDIO_PULL_DEADLINE_MS = 12_000;
+const AUDIO_PAGE_RETRIES = 3;
 
 function httpsUrl(url: string): string {
   if (url.startsWith("http://")) return "https://" + url.slice("http://".length);
@@ -411,15 +411,21 @@ async function yieldBriefly(): Promise<void> {
   if (sched?.wait) await sched.wait(1);
 }
 
-async function readBodyPage(res: Response, maxBytes: number): Promise<number> {
+async function readBodyPage(res: Response, maxBytes?: number): Promise<number> {
   const reader = res.body?.getReader();
   if (!reader) return 0;
   let n = 0;
+  let sinceYield = 0;
   try {
-    while (n < maxBytes) {
+    while (maxBytes == null || n < maxBytes) {
       const { done, value } = await reader.read();
       if (done) break;
       n += value.byteLength;
+      sinceYield += value.byteLength;
+      if (sinceYield >= AUDIO_PAGE_BYTES) {
+        sinceYield = 0;
+        await yieldBriefly();
+      }
     }
   } finally {
     try {
@@ -468,61 +474,80 @@ async function pullAudioPage(
   const ranged = res.status === 206 || !!contentRange;
   const knownTotal = totalFromContentRange(contentRange) || total || 0;
   const contentLength = Number(res.headers.get("Content-Length") || 0);
-  const cap = ranged
-    ? contentLength > 0
-      ? contentLength
-      : pageBytes
-    : pageBytes;
-  const bytes = await readBodyPage(res, cap);
+  const bytes = ranged
+    ? await readBodyPage(res, contentLength > 0 ? contentLength : pageBytes)
+    : await readBodyPage(res);
   return { status: res.status, bytes, total: knownTotal, ranged };
+}
+
+async function pullAudioPageRetry(
+  cookie: string,
+  url: string,
+  offset: number,
+  pageBytes: number,
+  total?: number,
+): Promise<{ status: number; bytes: number; total: number; ranged: boolean }> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= AUDIO_PAGE_RETRIES; attempt++) {
+    try {
+      return await pullAudioPage(cookie, url, offset, pageBytes, total);
+    } catch (e) {
+      if (e instanceof CookieExpiredError) throw e;
+      lastError = e;
+      listenLog(
+        "audio.page.retry",
+        `offset=${offset} attempt=${attempt}/${AUDIO_PAGE_RETRIES} ${e instanceof Error ? e.message : String(e)}`,
+      );
+      await yieldBriefly();
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 async function pullAudio(cookie: string, url: string, sizeHint?: number): Promise<number> {
   const target = httpsUrl(url);
-  const deadline = Date.now() + AUDIO_PULL_DEADLINE_MS;
   let offset = 0;
   let total = sizeHint && sizeHint > 0 ? sizeHint : 0;
   let pulled = 0;
   let page = 0;
+  let eof = false;
 
-  while (true) {
-    if (total && offset >= total) break;
-    if (Date.now() >= deadline) {
-      listenLog("audio.partial", `bytes=${pulled} pages=${page} total=${total || "-"} reason=deadline`);
-      break;
-    }
-
+  while (!total || offset < total) {
     page += 1;
     const range = audioRangeHeader(offset, AUDIO_PAGE_BYTES, total || undefined);
     listenLog("audio.page", `page=${page} range=${range}`);
 
-    let result: { status: number; bytes: number; total: number; ranged: boolean };
-    try {
-      result = await pullAudioPage(cookie, target, offset, AUDIO_PAGE_BYTES, total || undefined);
-    } catch (e) {
-      if (e instanceof CookieExpiredError) throw e;
-      if (pulled > 0) {
-        listenLog("audio.partial", `bytes=${pulled} pages=${page} total=${total || "-"} reason=${e instanceof Error ? e.message : String(e)}`);
-        break;
-      }
-      throw e;
-    }
-
+    const result = await pullAudioPageRetry(cookie, target, offset, AUDIO_PAGE_BYTES, total || undefined);
     if (result.total) total = result.total;
-    if (result.status === 416) break;
-    if (result.bytes <= 0) break;
+    if (result.status === 416) {
+      if (pulled <= 0) throw new Error("音频 Range 416，没有可拉的数据");
+      eof = true;
+      break;
+    }
+    if (result.bytes <= 0) {
+      if (pulled <= 0) throw new Error("音频为空");
+      eof = true;
+      break;
+    }
 
     pulled += result.bytes;
     offset += result.bytes;
-    listenLog("audio.page.ok", `page=${page} status=${result.status} got=${result.bytes} pulled=${pulled} total=${total || "-"}`);
+    listenLog(
+      "audio.page.ok",
+      `page=${page} status=${result.status} got=${result.bytes} pulled=${pulled} total=${total || "-"}`,
+    );
 
     if (!result.ranged) {
-      listenLog("audio.no-range", `status=${result.status} 服务端未按 Range 分页，已停在第一页`);
+      listenLog("audio.no-range", `status=${result.status} 服务端未分页，已在同一响应里读完`);
+      eof = true;
       break;
     }
     await yieldBriefly();
   }
 
+  if (!eof && total && pulled < total) {
+    throw new Error(`音频未拉完 pulled=${pulled} total=${total}`);
+  }
   listenLog("audio.done", `bytes=${pulled} pages=${page} total=${total || "-"}`);
   return pulled;
 }
