@@ -41,7 +41,7 @@ http://localhost:8787/__scheduled
 
 ## 部署
 
-Worker 名和 D1 库名都是 `netease-musician`。Cloudflare 第一次部署会自动建库；之后把真实 `database_id` 写进 `wrangler.jsonc`，避免下次构建把绑定冲掉。表结构会在第一次访问时自动创建（和 [nodewarden](https://github.com/kukume/nodewarden) 一样），Git 构建不必再跑 `d1 migrations apply`。
+Worker 名和 D1 名字都是 `netease-musician`。`wrangler.jsonc` **不用填 `database_id`**：第一次 `wrangler deploy` 会按名字自动建库并绑定。表结构会在第一次访问时自动创建（和 [nodewarden](https://github.com/kukume/nodewarden) 一样）。
 
 密钥：
 

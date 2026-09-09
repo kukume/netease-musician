@@ -27,7 +27,6 @@
     {
       "binding": "DB",
       "database_name": "netease-musician",
-      "database_id": "5dcb30a9-397a-48e0-b53f-5bd41da18556",
       "migrations_dir": "migrations"
     }
   ]
