@@ -133,7 +133,7 @@ async function acquireWorkOrSkip(env: Env, owner: string, phase: WorkPhase): Pro
     return true;
   }
   const lock = await readWorkLock(env);
-  listenLog("work.skip", `busy=${lock.phase || "unknown"} 上一次还在下载或上报，本分钟退出`);
+  listenLog("work.skip", `busy=${lock.phase || "unknown"} 上一次还在开听或上报，本分钟退出`);
   return false;
 }
 
@@ -527,7 +527,7 @@ export async function tickListen(env: Env, ctx?: ExecutionContext): Promise<{
 
   const owner = newId();
   if (!(await acquireWorkOrSkip(env, owner, "tick"))) {
-    return { skipped: "上一次还在下载或上报", reported: 0, started: 0, success: 0, fail: 0 };
+    return { skipped: "上一次还在开听或上报", reported: 0, started: 0, success: 0, fail: 0 };
   }
   try {
     listenLog(
