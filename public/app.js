@@ -24,6 +24,8 @@ const state = {
   },
   qr: null,
   pollTimer: null,
+  statusTimer: null,
+  statusBusy: false,
   cap: { enabled: false, endpoint: "" },
 };
 
@@ -93,8 +95,16 @@ function listenState(a) {
   if (a.pendingSongId && a.reportAt > now) {
     return `正在听「${a.pendingSongName || a.pendingSongId}」，约 ${fmtRemain(a.reportAt - now)} 后上报`;
   }
+  if (a.pendingSongId && a.reportAt && a.reportAt <= now) {
+    return `正在上报「${a.pendingSongName || a.pendingSongId}」`;
+  }
   if (a.nextListenAt > now) return `空闲，约 ${fmtTime(a.nextListenAt)} 开听下一首`;
   return a.lastListenAt ? `上次 ${fmtTime(a.lastListenAt)}` : "等待随机开听";
+}
+
+function accountAwaitingReport(a) {
+  const now = Math.floor(Date.now() / 1000);
+  return !!(a.pendingSongId && a.reportAt && a.reportAt <= now);
 }
 
 function escapeHtml(s) {
@@ -102,6 +112,15 @@ function escapeHtml(s) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+function refreshCapWidget() {
+  const capEl = $("#cap");
+  if (!capEl || typeof capEl.reset !== "function") return;
+  capEl.reset();
+  if (typeof capEl.solve === "function") {
+    Promise.resolve(capEl.solve()).catch(() => {});
+  }
 }
 
 function coverSrc(src) {
@@ -125,11 +144,15 @@ function pager(kind, page, totalPages, total) {
 }
 
 function render() {
-  if (!state.user) return renderAuth();
+  if (!state.user) {
+    stopHomeStatusPoll();
+    return renderAuth();
+  }
   renderApp();
 }
 
 function renderAuth(mode = "login") {
+  stopHomeStatusPoll();
   app.innerHTML = `
     <div class="auth-wrap">
       <button class="btn ghost small theme-toggle" id="theme-toggle" type="button">${themeToggleLabel()}</button>
@@ -193,6 +216,7 @@ function renderAuth(mode = "login") {
       await loadHome();
     } catch (err) {
       toast(err.message, "error");
+      refreshCapWidget();
     }
   });
 }
@@ -237,6 +261,8 @@ function renderApp() {
   });
   bindHome();
   bindAdmin();
+  if (state.view === "home") startHomeStatusPoll();
+  else stopHomeStatusPoll();
 }
 
 function renderHome(playlist, current, o) {
@@ -280,12 +306,12 @@ function renderHome(playlist, current, o) {
           ${(accounts || [])
             .map(
               (a) => `
-            <div class="account">
+            <div class="account" data-account-id="${escapeHtml(a.id)}">
               ${coverTag(a.avatar, "avatar")}
               <div class="grow">
-                <div>${escapeHtml(a.nickname || "未命名")} ${a.status === "expired" ? '<span class="badge bad">登录失效</span>' : a.pendingSongId ? '<span class="badge">听歌中</span>' : ""}</div>
-                <div class="muted">${escapeHtml(listenState(a))}</div>
-                ${a.lastError && a.status !== "expired" ? `<div class="muted">${escapeHtml(a.lastError)}</div>` : ""}
+                <div>${escapeHtml(a.nickname || "未命名")} <span data-account-badges>${accountBadges(a)}</span></div>
+                <div class="muted" data-listen-status="${escapeHtml(a.id)}">${escapeHtml(listenState(a))}</div>
+                ${a.lastError && a.status !== "expired" ? `<div class="muted" data-account-error="${escapeHtml(a.id)}">${escapeHtml(a.lastError)}</div>` : `<div class="muted" data-account-error="${escapeHtml(a.id)}" hidden></div>`}
               </div>
               <button class="btn ghost small" data-unbind="${a.id}">解绑</button>
             </div>`,
@@ -416,6 +442,62 @@ function renderAdmin() {
       ${pager("logs", state.admin.logsPage, state.admin.logsTotalPages, state.admin.logsTotal)}
     </div>
   `;
+}
+
+function accountBadges(a) {
+  const now = Math.floor(Date.now() / 1000);
+  if (a.status === "expired") return '<span class="badge bad">登录失效</span>';
+  if (a.pendingSongId && a.reportAt > now) return '<span class="badge">听歌中</span>';
+  return "";
+}
+
+function stopHomeStatusPoll() {
+  clearInterval(state.statusTimer);
+  state.statusTimer = null;
+  state.statusBusy = false;
+}
+
+function startHomeStatusPoll() {
+  if (state.statusTimer) return;
+  let ticks = 0;
+  state.statusTimer = setInterval(() => {
+    if (document.hidden || state.view !== "home") return;
+    const reportDue = tickListenStatus();
+    ticks += 1;
+    if (reportDue || ticks % 4 === 0) void refreshHomeStatus();
+  }, 1000);
+}
+
+function tickListenStatus() {
+  let reportDue = false;
+  for (const a of state.overview?.accounts || []) {
+    const row = app.querySelector(`[data-account-id="${CSS.escape(a.id)}"]`);
+    if (!row) continue;
+    const statusEl = row.querySelector("[data-listen-status]");
+    const badgesEl = row.querySelector("[data-account-badges]");
+    if (statusEl) statusEl.textContent = listenState(a);
+    if (badgesEl) badgesEl.innerHTML = accountBadges(a);
+    if (accountAwaitingReport(a)) reportDue = true;
+  }
+  return reportDue;
+}
+
+async function refreshHomeStatus() {
+  if (state.statusBusy || !state.user || state.view !== "home") return;
+  state.statusBusy = true;
+  try {
+    const [overview, logs] = await Promise.all([api("/api/overview"), api("/api/logs")]);
+    if (state.view !== "home") return;
+    state.overview = overview;
+    state.logs = logs.logs || [];
+    const y = window.scrollY;
+    render();
+    window.scrollTo(0, y);
+  } catch {
+    /* keep showing the last known status */
+  } finally {
+    state.statusBusy = false;
+  }
 }
 
 function bindHome() {
@@ -675,5 +757,9 @@ async function boot() {
     renderAuth();
   }
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && state.user && state.view === "home") void refreshHomeStatus();
+});
 
 boot();
