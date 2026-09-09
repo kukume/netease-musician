@@ -1,12 +1,12 @@
 import { bootstrapAdmin } from "./auth";
 import { handleApi } from "./api";
 import { tickListen } from "./listen";
-import { dbNotReadyResponse, isDatabaseReady } from "./setup";
+import { dbNotReadyResponse, ensureSchema } from "./setup";
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (!(await isDatabaseReady(env))) {
+    if (!(await ensureSchema(env))) {
       return dbNotReadyResponse(url.pathname.startsWith("/api/"));
     }
     if (url.pathname.startsWith("/api/")) {
@@ -16,7 +16,7 @@ export default {
   },
 
   async scheduled(_controller, env, ctx) {
-    if (!(await isDatabaseReady(env))) {
+    if (!(await ensureSchema(env))) {
       console.log("[listen] scheduled.skip 数据库未就绪");
       return;
     }

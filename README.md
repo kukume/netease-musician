@@ -41,13 +41,7 @@ http://localhost:8787/__scheduled
 
 ## 部署
 
-`wrangler.jsonc` 里只写了 D1 名字 `netease-musician`，**不用填 `database_id`**。第一次 `wrangler deploy` 会按名字自动建库并绑定（和 [nodewarden](https://github.com/kukume/nodewarden) 一样）。
-
-Git 接到 Cloudflare Workers Builds 时，部署命令建议用 `npm run deploy`（会部署再跑远程迁移）。若只跑 `npx wrangler deploy`，库会建好但表还空，需再执行一次：
-
-```bash
-npx wrangler d1 migrations apply netease-musician --remote
-```
+Worker 名和 D1 名字都是 `netease-musician`。`wrangler.jsonc` **不用填 `database_id`**：第一次 `wrangler deploy` 会按名字自动建库并绑定。表结构会在第一次访问时自动创建（和 [nodewarden](https://github.com/kukume/nodewarden) 一样），不必单独跑迁移。
 
 密钥：
 
