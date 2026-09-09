@@ -386,157 +386,6 @@ export async function fetchPublicPlaylist(playlistId: string): Promise<PlaylistI
   return fetchPlaylist(cookie, playlistId);
 }
 
-const AUDIO_PAGE_BYTES = 256 * 1024;
-const AUDIO_PAGE_TIMEOUT_MS = 20_000;
-const AUDIO_PAGE_RETRIES = 3;
-
-function httpsUrl(url: string): string {
-  if (url.startsWith("http://")) return "https://" + url.slice("http://".length);
-  return url;
-}
-
-function audioRangeHeader(offset: number, pageBytes: number, total?: number): string {
-  const last = offset + pageBytes - 1;
-  const end = total && total > 0 ? Math.min(last, total - 1) : last;
-  return `bytes=${offset}-${end}`;
-}
-
-function totalFromContentRange(header: string | null): number {
-  const match = /\/(\d+)\s*$/.exec(header || "");
-  return match ? Number(match[1]) : 0;
-}
-
-async function yieldBriefly(): Promise<void> {
-  const sched = (globalThis as unknown as { scheduler?: { wait(delay: number): Promise<void> } }).scheduler;
-  if (sched?.wait) await sched.wait(1);
-}
-
-async function discardBody(res: Response): Promise<number> {
-  const body = res.body;
-  if (!body) return 0;
-  let n = 0;
-  await body.pipeTo(
-    new WritableStream({
-      write(chunk) {
-        n += (chunk as Uint8Array).byteLength;
-      },
-    }),
-  );
-  return n;
-}
-
-function audioHeaders(cookie: string, range: string): HeadersInit {
-  return {
-    "User-Agent": UA,
-    Referer: ORIGIN + "/",
-    Cookie: cookie,
-    Range: range,
-    "Accept-Encoding": "identity;q=1, *;q=0",
-    "Sec-Fetch-Dest": "audio",
-    "Sec-Fetch-Mode": "no-cors",
-    "Sec-Fetch-Site": "cross-site",
-  };
-}
-
-async function pullAudioPage(
-  cookie: string,
-  url: string,
-  offset: number,
-  pageBytes: number,
-  total?: number,
-): Promise<{ status: number; bytes: number; total: number; ranged: boolean }> {
-  const range = audioRangeHeader(offset, pageBytes, total);
-  const res = await fetch(url, {
-    headers: audioHeaders(cookie, range),
-    signal: AbortSignal.timeout(AUDIO_PAGE_TIMEOUT_MS),
-  });
-  if (res.status === 401 || res.status === 403) {
-    listenLog("audio.fail", `GET ${res.status} song-url`);
-    throw new CookieExpiredError();
-  }
-  if (res.status === 416) {
-    return { status: 416, bytes: 0, total: total || 0, ranged: true };
-  }
-  if (!res.ok && res.status !== 206) throw new Error(`音频 GET ${res.status}`);
-  const contentRange = res.headers.get("Content-Range");
-  const ranged = res.status === 206 || !!contentRange;
-  const knownTotal = totalFromContentRange(contentRange) || total || 0;
-  const bytes = await discardBody(res);
-  return { status: res.status, bytes, total: knownTotal, ranged };
-}
-
-async function pullAudioPageRetry(
-  cookie: string,
-  url: string,
-  offset: number,
-  pageBytes: number,
-  total?: number,
-): Promise<{ status: number; bytes: number; total: number; ranged: boolean }> {
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= AUDIO_PAGE_RETRIES; attempt++) {
-    try {
-      return await pullAudioPage(cookie, url, offset, pageBytes, total);
-    } catch (e) {
-      if (e instanceof CookieExpiredError) throw e;
-      lastError = e;
-      listenLog(
-        "audio.page.retry",
-        `offset=${offset} attempt=${attempt}/${AUDIO_PAGE_RETRIES} ${e instanceof Error ? e.message : String(e)}`,
-      );
-      await yieldBriefly();
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
-}
-
-async function pullAudio(cookie: string, url: string, sizeHint?: number): Promise<number> {
-  const target = httpsUrl(url);
-  let offset = 0;
-  let total = sizeHint && sizeHint > 0 ? sizeHint : 0;
-  let pulled = 0;
-  let page = 0;
-  let eof = false;
-
-  while (!total || offset < total) {
-    page += 1;
-    const range = audioRangeHeader(offset, AUDIO_PAGE_BYTES, total || undefined);
-    listenLog("audio.page", `page=${page} range=${range}`);
-
-    const result = await pullAudioPageRetry(cookie, target, offset, AUDIO_PAGE_BYTES, total || undefined);
-    if (result.total) total = result.total;
-    if (result.status === 416) {
-      if (pulled <= 0) throw new Error("音频 Range 416，没有可拉的数据");
-      eof = true;
-      break;
-    }
-    if (result.bytes <= 0) {
-      if (pulled <= 0) throw new Error("音频为空");
-      eof = true;
-      break;
-    }
-
-    pulled += result.bytes;
-    offset += result.bytes;
-    listenLog(
-      "audio.page.ok",
-      `page=${page} status=${result.status} got=${result.bytes} pulled=${pulled} total=${total || "-"}`,
-    );
-
-    if (!result.ranged) {
-      listenLog("audio.no-range", `status=${result.status} 服务端未分页，已在同一响应里读完`);
-      eof = true;
-      break;
-    }
-    await yieldBriefly();
-  }
-
-  if (!eof && total && pulled < total) {
-    throw new Error(`音频未拉完 pulled=${pulled} total=${total}`);
-  }
-  listenLog("audio.done", `bytes=${pulled} pages=${page} total=${total || "-"}`);
-  return pulled;
-}
-
 async function weblog(cookie: string, action: string, js: Record<string, unknown>): Promise<Record<string, unknown>> {
   const payload = {
     logs: JSON.stringify([
@@ -554,10 +403,9 @@ async function weblog(cookie: string, action: string, js: Record<string, unknown
 export async function startPlaySession(
   cookie: string,
   songId: string,
-  options?: { level?: string; pull?: boolean; fallbackDurationMs?: number },
+  options?: { level?: string; fallbackDurationMs?: number },
 ): Promise<{ durationS: number }> {
   const level = options?.level || "exhigh";
-  const pull = options?.pull !== false;
   const { json, response } = await weapiPost(
     PLAYER_URL,
     { ids: JSON.stringify([Number(songId)]), level, encodeType: "aac" },
@@ -576,10 +424,6 @@ export async function startPlaySession(
     "player.url",
     `id=${info.id || songId} http=${response.status} code=${json.code} br=${info.br} size=${info.size} type=${info.type} level=${info.level} duration=${durationS.toFixed(3)}s`,
   );
-  if (pull) {
-    listenLog("audio.begin", `id=${songId} size=${info.size || "-"} page=${AUDIO_PAGE_BYTES}`);
-    await pullAudio(cookie, String(info.url), Number(info.size) || undefined);
-  }
   await weblog(cookie, "startplay", { id: Number(songId), type: "song", content: `id=${songId}` });
   return { durationS };
 }
