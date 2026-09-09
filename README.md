@@ -41,17 +41,20 @@ http://localhost:8787/__scheduled
 
 ## 部署
 
-1. 创建 D1：`npx wrangler d1 create netease-musician`
-2. 把返回的 `database_id` 填进 `wrangler.jsonc`
-3. 执行迁移：`npx wrangler d1 migrations apply netease-musician --remote`
-4. 设置密钥：
+`wrangler.jsonc` 里只写了 D1 名字 `netease-musician`，**不用填 `database_id`**。第一次 `wrangler deploy` 会按名字自动建库并绑定（和 [nodewarden](https://github.com/kukume/nodewarden) 一样）。
+
+Git 接到 Cloudflare Workers Builds 时，部署命令建议用 `npm run deploy`（会部署再跑远程迁移）。若只跑 `npx wrangler deploy`，库会建好但表还空，需再执行一次：
+
+```bash
+npx wrangler d1 migrations apply netease-musician --remote
+```
+
+密钥：
 
 ```bash
 npx wrangler secret put ADMIN_PASSWORD
 npx wrangler secret put SESSION_SECRET
 ```
-
-5. `npx wrangler deploy`
 
 也可在 `wrangler.jsonc` 的 `vars` 或 Dashboard 里放非敏感的 `ADMIN_USERNAME`。启用 Cap 时再加上 `CAP_URL`、`CAP_SITE_KEY`，私钥用 `npx wrangler secret put CAP_SECRET_KEY`。
 
