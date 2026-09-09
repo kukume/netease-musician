@@ -1,4 +1,4 @@
-import { decryptText, encryptText, hashPassword, newId, nowSec, randomHex, verifyPassword } from "./crypto";
+import { decryptText, encryptText, hashPassword, newId, nowSec, passwordNeedsRehash, randomHex, verifyPassword } from "./crypto";
 
 export const SESSION_COOKIE = "nl_session";
 const SESSION_DAYS = 7;
@@ -45,10 +45,21 @@ export async function readJson<T>(request: Request): Promise<T> {
 }
 
 export async function bootstrapAdmin(env: Env): Promise<void> {
-  const row = await env.DB.prepare("SELECT id FROM users LIMIT 1").first();
-  if (row) return;
   const username = (env.ADMIN_USERNAME || "admin").trim();
   const password = env.ADMIN_PASSWORD || "changeme123";
+  const row = await env.DB.prepare("SELECT id, username, password_hash FROM users LIMIT 1").first<{
+    id: string;
+    username: string;
+    password_hash: string;
+  }>();
+  if (row) {
+    if (row.username === username && passwordNeedsRehash(row.password_hash)) {
+      await env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ?")
+        .bind(hashPassword(password), row.id)
+        .run();
+    }
+    return;
+  }
   const id = newId();
   await env.DB.prepare(
     "INSERT INTO users (id, username, password_hash, role, status, created_at) VALUES (?, ?, ?, 'admin', 'active', ?)",
@@ -103,4 +114,4 @@ export async function createSession(env: Env, userId: string): Promise<string> {
   return token;
 }
 
-export { hashPassword, verifyPassword, encryptText, decryptText, newId, nowSec, randomHex };
+export { hashPassword, verifyPassword, encryptText, decryptText, newId, nowSec, randomHex, passwordNeedsRehash };

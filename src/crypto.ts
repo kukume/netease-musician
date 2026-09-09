@@ -6,7 +6,8 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 
-const PBKDF2_ITERS = 120_000;
+/** Cloudflare Workers reject PBKDF2 iteration counts above 100000. */
+const PBKDF2_ITERS = 100_000;
 const AES_IV = Buffer.from("0102030405060708");
 
 export function randomHex(bytes = 16): string {
@@ -28,10 +29,18 @@ export function hashPassword(password: string): string {
   return `pbkdf2$${PBKDF2_ITERS}$${salt}$${hash}`;
 }
 
+export function passwordNeedsRehash(stored: string): boolean {
+  const parts = stored.split("$");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2") return true;
+  const iterations = Number(parts[1]);
+  return !Number.isFinite(iterations) || iterations > PBKDF2_ITERS || iterations < 1;
+}
+
 export function verifyPassword(password: string, stored: string): boolean {
   const parts = stored.split("$");
   if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
   const iterations = Number(parts[1]);
+  if (!Number.isFinite(iterations) || iterations < 1 || iterations > PBKDF2_ITERS) return false;
   const salt = parts[2];
   const expected = Buffer.from(parts[3], "hex");
   const actual = pbkdf2Sync(password, salt, iterations, expected.length, "sha256");
