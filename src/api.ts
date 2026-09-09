@@ -174,7 +174,9 @@ async function overview(env: Env, request: Request) {
   const user = await requireUser(env, request);
   if (user instanceof Response) return user;
   const meta = await getPlaylistMeta(env);
-  const tracks = await listTracks(env, 12);
+  const { page, pageSize, offset } = pageParams(request);
+  const tracksTotal = Number(meta?.track_count || 0);
+  const tracks = await listTracks(env, pageSize, offset);
   const now = nowSec();
   const accounts = await env.DB.prepare(
     `SELECT id, netease_uid as neteaseUid, nickname, avatar, status, last_listen_at as lastListenAt, last_error as lastError,
@@ -214,6 +216,10 @@ async function overview(env: Env, request: Request) {
       : null,
     current,
     tracks,
+    tracksPage: page,
+    tracksPageSize: pageSize,
+    tracksTotal,
+    tracksTotalPages: Math.max(1, Math.ceil(tracksTotal / pageSize)),
     accounts: accounts.results || [],
     boundCount: stats?.bound || 0,
     listeningCount: listening?.n || 0,
@@ -223,13 +229,18 @@ async function overview(env: Env, request: Request) {
 async function myLogs(env: Env, request: Request) {
   const user = await requireUser(env, request);
   if (user instanceof Response) return user;
+  const { page, pageSize, offset } = pageParams(request);
+  const totalRow = await env.DB.prepare("SELECT COUNT(*) as n FROM listen_logs WHERE user_id = ?")
+    .bind(user.id)
+    .first<{ n: number }>();
+  const total = Number(totalRow?.n || 0);
   const { results } = await env.DB.prepare(
     `SELECT id, song_id as songId, song_name as songName, artist, ok, message, created_at as createdAt
-     FROM listen_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`,
+     FROM listen_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
   )
-    .bind(user.id)
+    .bind(user.id, pageSize, offset)
     .all();
-  return ok({ logs: results || [] });
+  return ok({ logs: results || [], page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)) });
 }
 
 async function createQr(env: Env, request: Request) {

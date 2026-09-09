@@ -3,6 +3,12 @@ const state = {
   view: "home",
   overview: null,
   logs: [],
+  logsPage: 1,
+  logsTotal: 0,
+  logsTotalPages: 1,
+  tracksPage: 1,
+  tracksTotal: 0,
+  tracksTotalPages: 1,
   admin: {
     users: [],
     usersPage: 1,
@@ -288,15 +294,18 @@ function renderHome(playlist, current, o) {
           <div class="stat"><span class="muted">正在听</span><b>${o.listeningCount || 0}</b></div>
         </div>
         <div style="margin-top:18px">
+          <div class="muted">歌曲</div>
           ${tracks
-            .map(
-              (t, i) => `
+            .map((t, i) => {
+              const n = ((state.tracksPage || 1) - 1) * 15 + i + 1;
+              return `
             <div class="track">
-              <span>${String(i + 1).padStart(2, "0")}</span>
+              <span>${String(n).padStart(2, "0")}</span>
               <div><b>${escapeHtml(t.name)}</b><div class="muted">${escapeHtml(t.artist)}</div></div>
-            </div>`,
-            )
-            .join("")}
+            </div>`;
+            })
+            .join("") || `<div class="muted" style="margin-top:8px">暂无歌曲</div>`}
+          ${pager("home-tracks", state.tracksPage || 1, state.tracksTotalPages || 1, state.tracksTotal || 0)}
         </div>
       </div>
       <div>
@@ -333,6 +342,7 @@ function renderHome(playlist, current, o) {
               )
               .join("") || `<div class="muted">暂无记录</div>`}
           </div>
+          ${pager("home-logs", state.logsPage || 1, state.logsTotalPages || 1, state.logsTotal || 0)}
         </div>
       </div>
     </div>
@@ -482,14 +492,32 @@ function tickListenStatus() {
   return reportDue;
 }
 
+function homeTracksUrl() {
+  return `/api/overview?page=${state.tracksPage || 1}&pageSize=15`;
+}
+
+function homeLogsUrl() {
+  return `/api/logs?page=${state.logsPage || 1}&pageSize=15`;
+}
+
+function applyHomePayload(overview, logs) {
+  state.overview = overview;
+  state.logs = logs.logs || [];
+  state.tracksPage = overview.tracksPage || 1;
+  state.tracksTotal = overview.tracksTotal || 0;
+  state.tracksTotalPages = overview.tracksTotalPages || 1;
+  state.logsPage = logs.page || 1;
+  state.logsTotal = logs.total || 0;
+  state.logsTotalPages = logs.totalPages || 1;
+}
+
 async function refreshHomeStatus() {
   if (state.statusBusy || !state.user || state.view !== "home") return;
   state.statusBusy = true;
   try {
-    const [overview, logs] = await Promise.all([api("/api/overview"), api("/api/logs")]);
+    const [overview, logs] = await Promise.all([api(homeTracksUrl()), api(homeLogsUrl())]);
     if (state.view !== "home") return;
-    state.overview = overview;
-    state.logs = logs.logs || [];
+    applyHomePayload(overview, logs);
     const y = window.scrollY;
     render();
     window.scrollTo(0, y);
@@ -512,6 +540,25 @@ function bindHome() {
         await loadHome();
       } catch (e) {
         toast(e.message, "error");
+      }
+    };
+  });
+  app.querySelectorAll("[data-page]").forEach((btn) => {
+    btn.onclick = async () => {
+      if (btn.disabled) return;
+      const [kind, dir] = btn.dataset.page.split(":");
+      if (kind === "home-tracks") {
+        const next = dir === "next" ? (state.tracksPage || 1) + 1 : (state.tracksPage || 1) - 1;
+        if (next < 1 || next > (state.tracksTotalPages || 1)) return;
+        state.tracksPage = next;
+        await loadHome();
+        return;
+      }
+      if (kind === "home-logs") {
+        const next = dir === "next" ? (state.logsPage || 1) + 1 : (state.logsPage || 1) - 1;
+        if (next < 1 || next > (state.logsTotalPages || 1)) return;
+        state.logsPage = next;
+        await loadHome();
       }
     };
   });
@@ -709,9 +756,8 @@ async function startQr(wrap) {
 
 async function loadHome() {
   state.view = "home";
-  const [overview, logs] = await Promise.all([api("/api/overview"), api("/api/logs")]);
-  state.overview = overview;
-  state.logs = logs.logs || [];
+  const [overview, logs] = await Promise.all([api(homeTracksUrl()), api(homeLogsUrl())]);
+  applyHomePayload(overview, logs);
   render();
 }
 
