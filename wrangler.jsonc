@@ -18,11 +18,8 @@
   "triggers": {
     "crons": ["* * * * *"]
   },
-  // Cap Standalone：实例地址和 site key。私钥请放 .dev.vars 或 `wrangler secret put CAP_SECRET_KEY`。
-  "vars": {
-    "CAP_URL": "",
-    "CAP_SITE_KEY": ""
-  },
+  // Dashboard 里配置的 CAP_URL / CAP_SITE_KEY 等变量，部署时不要删掉或覆盖成空值。
+  "keep_vars": true,
   "d1_databases": [
     {
       "binding": "DB",

@@ -10,7 +10,7 @@
     "dev": "wrangler d1 migrations apply netease-musician --local && wrangler dev --test-scheduled",
     "types": "wrangler types",
     "check": "tsc --noEmit",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler deploy --keep-vars",
     "db:local": "wrangler d1 migrations apply netease-musician --local"
   },
   "devDependencies": {
