@@ -42,18 +42,7 @@ function who(account: { id: string; nickname?: string | null }) {
   return `account="${account.nickname || "未命名"}" id=${account.id.slice(0, 8)}`;
 }
 
-async function sleep(ms: number): Promise<void> {
-  const sched = (globalThis as unknown as { scheduler?: { wait(delay: number): Promise<void> } }).scheduler;
-  let left = ms;
-  while (left > 0) {
-    const step = Math.min(left, 25_000);
-    if (sched?.wait) await sched.wait(step);
-    else await new Promise((resolve) => setTimeout(resolve, step));
-    left -= step;
-  }
-}
-
-type WorkPhase = "tick" | "report";
+type WorkPhase = "tick";
 
 type WorkLock = {
   owner: string;
@@ -338,33 +327,6 @@ async function reportOne(env: Env, accountId: string): Promise<"ok" | "fail" | "
   }
 }
 
-function schedulePlayReport(
-  env: Env,
-  ctx: ExecutionContext | undefined,
-  account: { id: string; nickname?: string | null },
-  reportAt: number,
-  owner: string,
-) {
-  const waitMs = Math.max(0, reportAt * 1000 - Date.now());
-  listenLog("wait.play", `${who(account)} 模拟听歌 ${Math.round(waitMs / 1000)}s，到点后会打 report.start / weblog.play`);
-  const run = async () => {
-    try {
-      await sleep(waitMs);
-      listenLog("wait.play.due", `${who(account)} 等待结束，开始上报 play`);
-      if (!(await acquireWorkOrSkip(env, owner, "report"))) return;
-      try {
-        await reportOne(env, account.id);
-      } finally {
-        await releaseWork(env, owner);
-      }
-    } catch (e) {
-      listenLog("wait.play.fail", `${who(account)} ${e instanceof Error ? e.message : String(e)}`);
-    }
-  };
-  if (ctx) ctx.waitUntil(run());
-  else void run();
-}
-
 async function finishDueReports(env: Env): Promise<{ success: number; fail: number }> {
   const now = nowSec();
   const { results } = await env.DB.prepare(
@@ -386,13 +348,7 @@ async function finishDueReports(env: Env): Promise<{ success: number; fail: numb
   return { success, fail };
 }
 
-async function startDueAccounts(
-  env: Env,
-  playlistId: string,
-  trackCount: number,
-  ctx?: ExecutionContext,
-  owner?: string,
-): Promise<{ started: number; fail: number }> {
+async function startDueAccounts(env: Env, playlistId: string, trackCount: number): Promise<{ started: number; fail: number }> {
   const now = nowSec();
   await env.DB.prepare(
     `UPDATE netease_accounts
@@ -499,7 +455,6 @@ async function startDueAccounts(
         "start.ok",
         `${who(account)} duration=${Math.round(durationS)}s reportAt=${new Date(reportAt * 1000).toISOString()} gap=${gap}s`,
       );
-      schedulePlayReport(env, ctx, account, reportAt, owner || newId());
     } catch (e) {
       fail += 1;
       const expired = e instanceof CookieExpiredError;
@@ -512,7 +467,7 @@ async function startDueAccounts(
   return { started, fail };
 }
 
-export async function tickListen(env: Env, ctx?: ExecutionContext): Promise<{
+export async function tickListen(env: Env): Promise<{
   skipped?: string;
   reported: number;
   started: number;
@@ -552,7 +507,7 @@ export async function tickListen(env: Env, ctx?: ExecutionContext): Promise<{
       return { skipped: "尚未设置歌单", reported: reports.success + reports.fail, started: 0, success: reports.success, fail: reports.fail };
     }
 
-    const starts = await startDueAccounts(env, meta.playlist_id, meta.track_count, ctx, owner);
+    const starts = await startDueAccounts(env, meta.playlist_id, meta.track_count);
     await trimLogs(env);
     listenLog(
       "tick.done",
@@ -570,7 +525,7 @@ export async function tickListen(env: Env, ctx?: ExecutionContext): Promise<{
   }
 }
 
-export async function kickListen(env: Env, ctx?: ExecutionContext): Promise<{
+export async function kickListen(env: Env): Promise<{
   skipped?: string;
   scattered: number;
   reported: number;
@@ -580,6 +535,6 @@ export async function kickListen(env: Env, ctx?: ExecutionContext): Promise<{
 }> {
   const scattered = await scatterIdleAccounts(env, 1);
   listenLog("kick", `scattered=${scattered}`);
-  const tick = await tickListen(env, ctx);
+  const tick = await tickListen(env);
   return { ...tick, scattered };
 }
