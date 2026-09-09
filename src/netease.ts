@@ -411,29 +411,17 @@ async function yieldBriefly(): Promise<void> {
   if (sched?.wait) await sched.wait(1);
 }
 
-async function readBodyPage(res: Response, maxBytes?: number): Promise<number> {
-  const reader = res.body?.getReader();
-  if (!reader) return 0;
+async function discardBody(res: Response): Promise<number> {
+  const body = res.body;
+  if (!body) return 0;
   let n = 0;
-  let sinceYield = 0;
-  try {
-    while (maxBytes == null || n < maxBytes) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      n += value.byteLength;
-      sinceYield += value.byteLength;
-      if (sinceYield >= AUDIO_PAGE_BYTES) {
-        sinceYield = 0;
-        await yieldBriefly();
-      }
-    }
-  } finally {
-    try {
-      await reader.cancel();
-    } catch {
-      /* ignore */
-    }
-  }
+  await body.pipeTo(
+    new WritableStream({
+      write(chunk) {
+        n += (chunk as Uint8Array).byteLength;
+      },
+    }),
+  );
   return n;
 }
 
@@ -473,10 +461,7 @@ async function pullAudioPage(
   const contentRange = res.headers.get("Content-Range");
   const ranged = res.status === 206 || !!contentRange;
   const knownTotal = totalFromContentRange(contentRange) || total || 0;
-  const contentLength = Number(res.headers.get("Content-Length") || 0);
-  const bytes = ranged
-    ? await readBodyPage(res, contentLength > 0 ? contentLength : pageBytes)
-    : await readBodyPage(res);
+  const bytes = await discardBody(res);
   return { status: res.status, bytes, total: knownTotal, ranged };
 }
 
