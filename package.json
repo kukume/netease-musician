@@ -1,0 +1,26 @@
+{
+  "name": "netease-music-listen",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "wrangler d1 migrations apply netease-musician --local && wrangler dev --test-scheduled",
+    "types": "wrangler types",
+    "check": "tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 migrations apply netease-musician --local"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.130.0"
+  },
+  "dependencies": {
+    "cap-widget": "^0.1.57",
+    "capjs-core": "^0.1.2",
+    "uqr": "^0.1.3"
+  }
+}
