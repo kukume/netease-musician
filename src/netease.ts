@@ -386,47 +386,145 @@ export async function fetchPublicPlaylist(playlistId: string): Promise<PlaylistI
   return fetchPlaylist(cookie, playlistId);
 }
 
+const AUDIO_PAGE_BYTES = 256 * 1024;
+const AUDIO_PAGE_TIMEOUT_MS = 20_000;
+const AUDIO_PULL_DEADLINE_MS = 12_000;
+
 function httpsUrl(url: string): string {
   if (url.startsWith("http://")) return "https://" + url.slice("http://".length);
   return url;
 }
 
-async function pullAudio(cookie: string, url: string, sizeHint?: number): Promise<number> {
-  const res = await fetch(httpsUrl(url), {
-    headers: {
-      "User-Agent": UA,
-      Referer: ORIGIN + "/",
-      Cookie: cookie,
-      Range: "bytes=0-",
-      "Accept-Encoding": "identity;q=1, *;q=0",
-      "Sec-Fetch-Dest": "audio",
-      "Sec-Fetch-Mode": "no-cors",
-      "Sec-Fetch-Site": "cross-site",
-    },
-    signal: AbortSignal.timeout(180_000),
+function audioRangeHeader(offset: number, pageBytes: number, total?: number): string {
+  const last = offset + pageBytes - 1;
+  const end = total && total > 0 ? Math.min(last, total - 1) : last;
+  return `bytes=${offset}-${end}`;
+}
+
+function totalFromContentRange(header: string | null): number {
+  const match = /\/(\d+)\s*$/.exec(header || "");
+  return match ? Number(match[1]) : 0;
+}
+
+async function yieldBriefly(): Promise<void> {
+  const sched = (globalThis as unknown as { scheduler?: { wait(delay: number): Promise<void> } }).scheduler;
+  if (sched?.wait) await sched.wait(1);
+}
+
+async function readBodyPage(res: Response, maxBytes: number): Promise<number> {
+  const reader = res.body?.getReader();
+  if (!reader) return 0;
+  let n = 0;
+  try {
+    while (n < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      n += value.byteLength;
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* ignore */
+    }
+  }
+  return n;
+}
+
+function audioHeaders(cookie: string, range: string): HeadersInit {
+  return {
+    "User-Agent": UA,
+    Referer: ORIGIN + "/",
+    Cookie: cookie,
+    Range: range,
+    "Accept-Encoding": "identity;q=1, *;q=0",
+    "Sec-Fetch-Dest": "audio",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
+  };
+}
+
+async function pullAudioPage(
+  cookie: string,
+  url: string,
+  offset: number,
+  pageBytes: number,
+  total?: number,
+): Promise<{ status: number; bytes: number; total: number; ranged: boolean }> {
+  const range = audioRangeHeader(offset, pageBytes, total);
+  const res = await fetch(url, {
+    headers: audioHeaders(cookie, range),
+    signal: AbortSignal.timeout(AUDIO_PAGE_TIMEOUT_MS),
   });
   if (res.status === 401 || res.status === 403) {
     listenLog("audio.fail", `GET ${res.status} song-url`);
     throw new CookieExpiredError();
   }
-  if (!res.ok && res.status !== 206) throw new Error(`音频 GET ${res.status}`);
-  const reader = res.body?.getReader();
-  if (!reader) {
-    listenLog("audio.done", `GET ${res.status} bytes=0`);
-    return 0;
+  if (res.status === 416) {
+    return { status: 416, bytes: 0, total: total || 0, ranged: true };
   }
-  let n = 0;
+  if (!res.ok && res.status !== 206) throw new Error(`音频 GET ${res.status}`);
+  const contentRange = res.headers.get("Content-Range");
+  const ranged = res.status === 206 || !!contentRange;
+  const knownTotal = totalFromContentRange(contentRange) || total || 0;
+  const contentLength = Number(res.headers.get("Content-Length") || 0);
+  const cap = ranged
+    ? contentLength > 0
+      ? contentLength
+      : pageBytes
+    : pageBytes;
+  const bytes = await readBodyPage(res, cap);
+  return { status: res.status, bytes, total: knownTotal, ranged };
+}
+
+async function pullAudio(cookie: string, url: string, sizeHint?: number): Promise<number> {
+  const target = httpsUrl(url);
+  const deadline = Date.now() + AUDIO_PULL_DEADLINE_MS;
+  let offset = 0;
+  let total = sizeHint && sizeHint > 0 ? sizeHint : 0;
+  let pulled = 0;
+  let page = 0;
+
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    n += value.byteLength;
-    if (sizeHint && n >= sizeHint) {
-      await reader.cancel();
+    if (total && offset >= total) break;
+    if (Date.now() >= deadline) {
+      listenLog("audio.partial", `bytes=${pulled} pages=${page} total=${total || "-"} reason=deadline`);
       break;
     }
+
+    page += 1;
+    const range = audioRangeHeader(offset, AUDIO_PAGE_BYTES, total || undefined);
+    listenLog("audio.page", `page=${page} range=${range}`);
+
+    let result: { status: number; bytes: number; total: number; ranged: boolean };
+    try {
+      result = await pullAudioPage(cookie, target, offset, AUDIO_PAGE_BYTES, total || undefined);
+    } catch (e) {
+      if (e instanceof CookieExpiredError) throw e;
+      if (pulled > 0) {
+        listenLog("audio.partial", `bytes=${pulled} pages=${page} total=${total || "-"} reason=${e instanceof Error ? e.message : String(e)}`);
+        break;
+      }
+      throw e;
+    }
+
+    if (result.total) total = result.total;
+    if (result.status === 416) break;
+    if (result.bytes <= 0) break;
+
+    pulled += result.bytes;
+    offset += result.bytes;
+    listenLog("audio.page.ok", `page=${page} status=${result.status} got=${result.bytes} pulled=${pulled} total=${total || "-"}`);
+
+    if (!result.ranged) {
+      listenLog("audio.no-range", `status=${result.status} 服务端未按 Range 分页，已停在第一页`);
+      break;
+    }
+    await yieldBriefly();
   }
-  listenLog("audio.done", `GET ${res.status} bytes=${n} range=${res.headers.get("Content-Range") || "-"}`);
-  return n;
+
+  listenLog("audio.done", `bytes=${pulled} pages=${page} total=${total || "-"}`);
+  return pulled;
 }
 
 async function weblog(cookie: string, action: string, js: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -469,7 +567,7 @@ export async function startPlaySession(
     `id=${info.id || songId} http=${response.status} code=${json.code} br=${info.br} size=${info.size} type=${info.type} level=${info.level} duration=${durationS.toFixed(3)}s`,
   );
   if (pull) {
-    listenLog("audio.begin", `id=${songId} size=${info.size || "-"}`);
+    listenLog("audio.begin", `id=${songId} size=${info.size || "-"} page=${AUDIO_PAGE_BYTES}`);
     await pullAudio(cookie, String(info.url), Number(info.size) || undefined);
   }
   await weblog(cookie, "startplay", { id: Number(songId), type: "song", content: `id=${songId}` });
