@@ -84,6 +84,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     }
     if (method === "GET" && path === "/api/admin/playlist") return adminPlaylist(env, request);
     if (method === "PUT" && path === "/api/admin/playlist") return setPlaylist(env, request);
+    if (method === "POST" && path === "/api/admin/playlist/refresh") return refreshPlaylist(env, request);
     if (method === "PUT" && path === "/api/admin/listen") return setListen(env, request);
     if (method === "POST" && path === "/api/admin/listen/run") return manualListen(env, request, ctx);
     if (method === "GET" && path === "/api/admin/logs") return adminLogs(env, request);
@@ -487,6 +488,15 @@ async function setPlaylist(env: Env, request: Request) {
   const body = await readJson<{ playlist?: string }>(request);
   if (!body.playlist) return err("请填写歌单 ID 或链接");
   const result = await savePlaylist(env, body.playlist);
+  return ok(result);
+}
+
+async function refreshPlaylist(env: Env, request: Request) {
+  const admin = await requireAdmin(env, request);
+  if (admin instanceof Response) return admin;
+  const meta = await getPlaylistMeta(env);
+  if (!meta?.playlist_id) return err("还没有保存歌单");
+  const result = await savePlaylist(env, meta.playlist_id);
   return ok(result);
 }
 

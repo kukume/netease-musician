@@ -359,6 +359,7 @@ function renderAdmin() {
       <form id="playlist-form" style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
         <input name="playlist" placeholder="https://music.163.com/playlist?id=..." style="flex:1;min-width:240px" />
         <button class="btn small" type="submit">拉取并保存</button>
+        ${p.playlist_id ? `<button class="btn ghost small" id="refresh-playlist" type="button">重新拉取歌单</button>` : ""}
         <button class="btn ghost small" id="toggle-listen" type="button">${p.listen_enabled ? "暂停听歌" : "开启听歌"}</button>
         <button class="btn ghost small" id="run-now" type="button">立即调度空闲账号</button>
       </form>
@@ -579,6 +580,24 @@ function bindAdmin() {
       toast(err.message, "error");
     }
   };
+  const refreshBtn = $("#refresh-playlist");
+  if (refreshBtn) {
+    refreshBtn.onclick = async () => {
+      const prev = refreshBtn.textContent;
+      refreshBtn.disabled = true;
+      refreshBtn.textContent = "正在拉取…";
+      try {
+        const data = await api("/api/admin/playlist/refresh", { method: "POST" });
+        toast(`已重新拉取「${data.name}」，共 ${data.trackCount} 首`);
+        state.admin.tracksPage = 1;
+        await loadAdmin();
+      } catch (err) {
+        toast(err.message, "error");
+        refreshBtn.disabled = false;
+        refreshBtn.textContent = prev;
+      }
+    };
+  }
   $("#toggle-listen").onclick = async () => {
     const enabled = !(state.admin.playlist || {}).listen_enabled;
     try {
