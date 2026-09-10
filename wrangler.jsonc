@@ -16,7 +16,33 @@
     "run_worker_first": true
   },
   "triggers": {
-    "crons": ["*/2 * * * *"]
+    "crons": ["*/5 * * * *"]
+  },
+  "queues": {
+    "producers": [
+      { "binding": "LISTEN_START", "queue": "netease-musician-start" },
+      { "binding": "LISTEN_REPORT", "queue": "netease-musician-report" }
+    ],
+    "consumers": [
+      {
+        "queue": "netease-musician-start",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "max_concurrency": 2,
+        "retry_delay": 45,
+        "dead_letter_queue": "netease-musician-start-dlq"
+      },
+      {
+        "queue": "netease-musician-report",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 5,
+        "max_concurrency": 5,
+        "retry_delay": 20,
+        "dead_letter_queue": "netease-musician-report-dlq"
+      }
+    ]
   },
   // Dashboard 里配置的明文变量（如 CAP_URL / CAP_SITE_KEY）不要写进 vars。
   // wrangler.jsonc 里的空字符串每次部署都会覆盖 Dashboard。

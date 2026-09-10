@@ -45,6 +45,9 @@ const STATEMENTS = [
     pending_duration INTEGER NOT NULL DEFAULT 0,
     pending_source_id TEXT,
     artist_id TEXT,
+    wake_kind TEXT,
+    wake_at INTEGER NOT NULL DEFAULT 0,
+    wake_token TEXT,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`,
   `CREATE TABLE IF NOT EXISTS qr_sessions (
@@ -119,6 +122,7 @@ const STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_invite_code ON invite_codes(code)`,
   `CREATE INDEX IF NOT EXISTS idx_netease_next_listen ON netease_accounts(status, next_listen_at)`,
   `CREATE INDEX IF NOT EXISTS idx_netease_report ON netease_accounts(status, report_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_netease_wake ON netease_accounts(status, wake_at)`,
   `CREATE INDEX IF NOT EXISTS idx_sms_sessions_user ON sms_sessions(user_id)`,
 ];
 
@@ -184,6 +188,15 @@ const FILE_MIGRATIONS: { name: string; statements: string[] }[] = [
   {
     name: "0009_account_artist_id.sql",
     statements: ["ALTER TABLE netease_accounts ADD COLUMN artist_id TEXT"],
+  },
+  {
+    name: "0010_account_wake.sql",
+    statements: [
+      "ALTER TABLE netease_accounts ADD COLUMN wake_kind TEXT",
+      "ALTER TABLE netease_accounts ADD COLUMN wake_at INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE netease_accounts ADD COLUMN wake_token TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_netease_wake ON netease_accounts(status, wake_at)",
+    ],
   },
 ];
 

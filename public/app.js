@@ -106,7 +106,7 @@ function cronStatusText(cron) {
     cron.leftoverStarts || cron.leftoverReports
       ? `，剩余 ${cron.leftoverStarts || 0} 开听 / ${cron.leftoverReports || 0} 上报留给下轮`
       : "";
-  return `定时任务 ${when}正常 · 开听 ${cron.started || 0} / 上报 ${cron.reported || 0} · ${cron.wallMs || 0}ms${extra}`;
+  return `定时任务 ${when}正常 · 补漏开听 ${cron.started || 0} / 上报 ${cron.reported || 0} · ${cron.wallMs || 0}ms${extra}`;
 }
 
 function listenState(a) {
@@ -293,7 +293,7 @@ function renderHome(playlist, current, o) {
     <div class="grid">
       <div class="card">
         <h2>${playlist.name ? escapeHtml(playlist.name) : "等待管理员设置歌单"}</h2>
-        <div class="muted">${playlist.listenEnabled === false ? "互助听歌已暂停" : "每 2 分钟扫描到期账号：各自随机开听，跳过自己的歌，听完一首才排下一首。"}</div>
+        <div class="muted">${playlist.listenEnabled === false ? "互助听歌已暂停" : "每个账号自己排队开听和上报，时间错开；定时任务只补丢了的闹钟。"}</div>
         <div class="muted" data-cron-status>${escapeHtml(cronStatusText(o.cron))}</div>
         <div class="nowplay">
           ${coverTag(current.cover || playlist.cover)}
@@ -370,7 +370,7 @@ function renderAdmin() {
   return `
     <div class="card" style="margin-bottom:18px">
       <h2>互助歌单</h2>
-      <div class="muted">粘贴网易云歌单链接或 ID。保存后每个绑定账号会按自己的进度、在随机时间听这个歌单。</div>
+      <div class="muted">粘贴网易云歌单链接或 ID。保存后每个绑定账号按自己的进度错开听这个歌单；定时任务只补丢了的闹钟。</div>
       <div class="muted" data-cron-status>${escapeHtml(cronStatusText(state.admin.cron))}</div>
       <form id="playlist-form" style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
         <input name="playlist" placeholder="https://music.163.com/playlist?id=..." style="flex:1;min-width:240px" />

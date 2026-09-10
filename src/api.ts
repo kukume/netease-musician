@@ -31,7 +31,7 @@ import {
   sendSmsCode,
 } from "./netease";
 import { applyPendingMigrations, listMigrations } from "./schema";
-import { getCronHeartbeat, getPlaylistMeta, kickListen, listTracks, randomListenAt, savePlaylist } from "./listen";
+import { getCronHeartbeat, getPlaylistMeta, kickListen, listTracks, onAccountBound, onListenEnabledChange, savePlaylist } from "./listen";
 import { qrToSvg } from "./qr";
 import { publicCapConfig, verifyCapToken } from "./cap";
 
@@ -57,30 +57,48 @@ async function upsertNeteaseAccount(
   profile: { uid: string; nickname: string; avatar: string; artistId?: string },
 ) {
   const cookieEnc = await encryptText(env.SESSION_SECRET, cookie);
-  const nextAt = randomListenAt();
   let artistId = profile.artistId || "";
   if (!artistId && profile.uid) artistId = await fetchUserArtistId(cookie, profile.uid);
   const existing = profile.uid
-    ? await env.DB.prepare("SELECT id FROM netease_accounts WHERE user_id = ? AND netease_uid = ?")
+    ? await env.DB.prepare(
+        `SELECT id, pending_song_id as pendingSongId, wake_at as wakeAt, wake_kind as wakeKind, wake_token as wakeToken
+         FROM netease_accounts WHERE user_id = ? AND netease_uid = ?`,
+      )
         .bind(userId, profile.uid)
-        .first<{ id: string }>()
+        .first<{
+          id: string;
+          pendingSongId: string | null;
+          wakeAt: number | null;
+          wakeKind: string | null;
+          wakeToken: string | null;
+        }>()
     : null;
   if (existing) {
     await env.DB.prepare(
       `UPDATE netease_accounts
-       SET nickname = ?, avatar = ?, cookie_enc = ?, status = 'active', last_error = NULL, artist_id = CASE WHEN ? != '' THEN ? ELSE artist_id END,
-           next_listen_at = CASE WHEN pending_song_id IS NOT NULL THEN next_listen_at ELSE ? END
+       SET nickname = ?, avatar = ?, cookie_enc = ?, status = 'active', last_error = NULL,
+           artist_id = CASE WHEN ? != '' THEN ? ELSE artist_id END
        WHERE id = ?`,
     )
-      .bind(profile.nickname, profile.avatar, cookieEnc, artistId, artistId, nextAt, existing.id)
+      .bind(profile.nickname, profile.avatar, cookieEnc, artistId, artistId, existing.id)
       .run();
+    await onAccountBound(env, {
+      id: existing.id,
+      isNew: false,
+      pendingSongId: existing.pendingSongId,
+      wakeAt: existing.wakeAt,
+      wakeKind: existing.wakeKind,
+      wakeToken: existing.wakeToken,
+    });
   } else {
+    const id = newId();
     await env.DB.prepare(
       `INSERT INTO netease_accounts (id, user_id, netease_uid, nickname, avatar, cookie_enc, status, created_at, next_listen_at, artist_id)
-       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, 0, ?)`,
     )
-      .bind(newId(), userId, profile.uid || null, profile.nickname, profile.avatar, cookieEnc, nowSec(), nextAt, artistId || null)
+      .bind(id, userId, profile.uid || null, profile.nickname, profile.avatar, cookieEnc, nowSec(), artistId || null)
       .run();
+    await onAccountBound(env, { id, isNew: true });
   }
   return profile;
 }
@@ -628,10 +646,12 @@ async function setListen(env: Env, request: Request) {
   const admin = await requireAdmin(env, request);
   if (admin instanceof Response) return admin;
   const body = await readJson<{ enabled?: boolean }>(request);
+  const enabled = !!body.enabled;
   await env.DB.prepare("UPDATE playlist_meta SET listen_enabled = ?, updated_at = ? WHERE id = 1")
-    .bind(body.enabled ? 1 : 0, nowSec())
+    .bind(enabled ? 1 : 0, nowSec())
     .run();
-  return ok({ listenEnabled: !!body.enabled });
+  await onListenEnabledChange(env, enabled);
+  return ok({ listenEnabled: enabled });
 }
 
 async function manualListen(env: Env, request: Request) {

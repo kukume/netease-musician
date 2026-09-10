@@ -1,5 +1,5 @@
 import { handleApi } from "./api";
-import { recordCronError, tickListen } from "./listen";
+import { handleListenQueue, recordCronError, tickListen, type ListenQueueMessage } from "./listen";
 import { dbNotReadyResponse, ensureSchema } from "./setup";
 
 export default {
@@ -35,4 +35,13 @@ export default {
       console.log(`[listen] scheduled.end wallMs=${Date.now() - t0}`);
     }
   },
-} satisfies ExportedHandler<Env>;
+
+  async queue(batch, env) {
+    if (!(await ensureSchema(env))) {
+      console.log("[listen] queue.skip 数据库未就绪");
+      batch.retryAll({ delaySeconds: 30 });
+      return;
+    }
+    await handleListenQueue(env, batch);
+  },
+} satisfies ExportedHandler<Env, ListenQueueMessage>;

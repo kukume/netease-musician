@@ -12,20 +12,53 @@ import {
 } from "./netease";
 
 const CLAIM_SECONDS = 90;
-const MAX_STARTS_PER_TICK = 6;
-const MAX_REPORTS_PER_TICK = 40;
 const MAX_SONG_TRIES = 3;
-const CONCURRENCY = 3;
-const TICK_BUDGET_MS = 45_000;
+const START_BUDGET_MS = 50_000;
 const REPORT_STALE_SEC = 10 * 60;
-const CRON_HEALTHY_SEC = 300;
+const CRON_HEALTHY_SEC = 720;
 const GAP_MIN_SEC = 40;
 const GAP_MAX_SEC = 180;
-const SCATTER_MAX_SEC = 240;
-const WORK_LOCK_KEY = "listen_work";
-const WORK_LOCK_IDLE = '{"owner":"","phase":"idle","expiresAt":0}';
-const WORK_LOCK_TTL_SEC = 90;
+const BIND_START_MIN_SEC = 20;
+const BIND_START_MAX_SEC = 180;
+const REPORT_TAIL_MIN_SEC = 3;
+const REPORT_TAIL_MAX_SEC = 12;
+const REPAIR_GRACE_SEC = 180;
+const REPAIR_SCATTER_MAX_SEC = 120;
+const KICK_SCATTER_MAX_SEC = 30;
+const MAX_REPAIR_PER_TICK = 40;
 const HEARTBEAT_KEY = "listen_cron";
+
+export type WakeKind = "start" | "report";
+
+export type ListenQueueMessage = {
+  type: WakeKind;
+  accountId: string;
+  token: string;
+  songId?: string;
+};
+
+type QueueAction = "ack" | "retry";
+
+type AccountRow = {
+  id: string;
+  user_id: string;
+  cookie_enc: string;
+  nickname: string | null;
+  status: string;
+  listen_cursor: number;
+  artist_id?: string | null;
+  pending_song_id: string | null;
+  pending_song_name: string | null;
+  pending_artist: string | null;
+  pending_duration: number;
+  pending_source_id: string | null;
+  report_at: number;
+  listening_until: number;
+  next_listen_at: number;
+  wake_kind: string | null;
+  wake_at: number;
+  wake_token: string | null;
+};
 
 function randInt(min: number, max: number): number {
   const span = max - min + 1;
@@ -34,12 +67,20 @@ function randInt(min: number, max: number): number {
   return min + (buf[0] % span);
 }
 
-export function randomListenAt(now = nowSec(), maxSec = 120): number {
-  return now + randInt(0, Math.max(0, maxSec));
-}
-
 function nextGapSec(): number {
   return randInt(GAP_MIN_SEC, GAP_MAX_SEC);
+}
+
+function bindStartDelaySec(): number {
+  return randInt(BIND_START_MIN_SEC, BIND_START_MAX_SEC);
+}
+
+function reportDelaySec(durationS: number): number {
+  return Math.max(1, Math.round(durationS)) + randInt(REPORT_TAIL_MIN_SEC, REPORT_TAIL_MAX_SEC);
+}
+
+function clampDelay(sec: number): number {
+  return Math.max(0, Math.min(86400, Math.round(sec)));
 }
 
 function listenLog(step: string, detail?: string) {
@@ -70,21 +111,10 @@ function overBudget(deadline: number): boolean {
   return Date.now() >= deadline;
 }
 
-async function mapPool<T, R>(items: T[], fn: (item: T) => Promise<R>, deadline: number): Promise<{ outcomes: R[]; leftover: number }> {
-  const outcomes: R[] = [];
-  for (let i = 0; i < items.length; i += CONCURRENCY) {
-    if (overBudget(deadline)) return { outcomes, leftover: items.length - i };
-    const chunk = items.slice(i, i + CONCURRENCY);
-    outcomes.push(...(await Promise.all(chunk.map(fn))));
-  }
-  return { outcomes, leftover: 0 };
+function hasValidWake(row: { wake_token?: string | null; wake_at?: number | null; wake_kind?: string | null }, now = nowSec()): boolean {
+  const kind = row.wake_kind === "start" || row.wake_kind === "report" ? row.wake_kind : "";
+  return Boolean(row.wake_token && kind && Number(row.wake_at || 0) > now);
 }
-
-type WorkLock = {
-  owner: string;
-  phase: string;
-  expiresAt: number;
-};
 
 export type CronHeartbeat = {
   at: number;
@@ -98,60 +128,6 @@ export type CronHeartbeat = {
   ageSec: number;
   healthy: boolean;
 };
-
-async function ensureWorkLockRow(env: Env) {
-  await env.DB.prepare("INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)").bind(WORK_LOCK_KEY, WORK_LOCK_IDLE).run();
-}
-
-async function readWorkLock(env: Env): Promise<WorkLock> {
-  const row = await env.DB.prepare("SELECT value FROM site_settings WHERE key = ?").bind(WORK_LOCK_KEY).first<{ value: string }>();
-  try {
-    const value = JSON.parse(row?.value || WORK_LOCK_IDLE) as Partial<WorkLock>;
-    return {
-      owner: String(value.owner || ""),
-      phase: String(value.phase || "idle"),
-      expiresAt: Number(value.expiresAt || 0),
-    };
-  } catch {
-    return { owner: "", phase: "idle", expiresAt: 0 };
-  }
-}
-
-async function tryAcquireWork(env: Env, owner: string, phase: string): Promise<boolean> {
-  await ensureWorkLockRow(env);
-  const now = nowSec();
-  const expires = now + WORK_LOCK_TTL_SEC;
-  const result = await env.DB.prepare(
-    `UPDATE site_settings
-     SET value = json_object('owner', ?, 'phase', ?, 'expiresAt', ?)
-     WHERE key = ?
-     AND (
-       coalesce(json_extract(value, '$.owner'), '') = ''
-       OR coalesce(json_extract(value, '$.expiresAt'), 0) <= ?
-     )`,
-  )
-    .bind(owner, phase, expires, WORK_LOCK_KEY, now)
-    .run();
-  return Number(result.meta.changes || 0) > 0;
-}
-
-async function releaseWork(env: Env, owner: string): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE site_settings SET value = ? WHERE key = ? AND coalesce(json_extract(value, '$.owner'), '') = ?`,
-  )
-    .bind(WORK_LOCK_IDLE, WORK_LOCK_KEY, owner)
-    .run();
-}
-
-async function acquireWorkOrSkip(env: Env, owner: string, phase: string): Promise<boolean> {
-  if (await tryAcquireWork(env, owner, phase)) {
-    listenLog("work.hold", `owner=${owner.slice(0, 8)} phase=${phase} ttl=${WORK_LOCK_TTL_SEC}s`);
-    return true;
-  }
-  const lock = await readWorkLock(env);
-  listenLog("work.skip", `busy=${lock.phase || "unknown"} 上一次开听还在跑，本轮只上报`);
-  return false;
-}
 
 async function writeHeartbeat(env: Env, data: Omit<CronHeartbeat, "ageSec" | "healthy">): Promise<void> {
   await env.DB.prepare("INSERT OR REPLACE INTO site_settings (key, value) VALUES (?, ?)").bind(HEARTBEAT_KEY, JSON.stringify(data)).run();
@@ -192,19 +168,102 @@ export async function getCronHeartbeat(env: Env): Promise<CronHeartbeat> {
   }
 }
 
-type AccountRow = {
-  id: string;
-  user_id: string;
-  cookie_enc: string;
-  nickname: string | null;
-  listen_cursor: number;
-  artist_id?: string | null;
-  pending_song_id: string | null;
-  pending_song_name: string | null;
-  pending_artist: string | null;
-  pending_duration: number;
-  pending_source_id: string | null;
-};
+async function loadAccount(env: Env, accountId: string): Promise<AccountRow | null> {
+  return env.DB.prepare(
+    `SELECT id, user_id, cookie_enc, nickname, status, listen_cursor, artist_id,
+            pending_song_id, pending_song_name, pending_artist, pending_duration, pending_source_id,
+            report_at, listening_until, next_listen_at, wake_kind, wake_at, wake_token
+     FROM netease_accounts WHERE id = ?`,
+  )
+    .bind(accountId)
+    .first<AccountRow>();
+}
+
+async function sendWake(env: Env, kind: WakeKind, body: ListenQueueMessage, delaySeconds: number): Promise<void> {
+  const queue = kind === "start" ? env.LISTEN_START : env.LISTEN_REPORT;
+  await queue.send(body, { delaySeconds });
+}
+
+async function scheduleWake(
+  env: Env,
+  accountId: string,
+  kind: WakeKind,
+  delaySec: number,
+  extra?: { songId?: string },
+): Promise<void> {
+  const token = newId();
+  const delay = clampDelay(delaySec);
+  const wakeAt = nowSec() + delay;
+  const nextListenAt = kind === "start" ? wakeAt : undefined;
+  if (nextListenAt != null) {
+    await env.DB.prepare(
+      `UPDATE netease_accounts SET wake_kind = ?, wake_at = ?, wake_token = ?, next_listen_at = ? WHERE id = ?`,
+    )
+      .bind(kind, wakeAt, token, nextListenAt, accountId)
+      .run();
+  } else {
+    await env.DB.prepare(`UPDATE netease_accounts SET wake_kind = ?, wake_at = ?, wake_token = ? WHERE id = ?`)
+      .bind(kind, wakeAt, token, accountId)
+      .run();
+  }
+  const body: ListenQueueMessage = { type: kind, accountId, token };
+  if (extra?.songId) body.songId = extra.songId;
+  try {
+    await sendWake(env, kind, body, delay);
+    listenLog("wake.send", `kind=${kind} id=${accountId.slice(0, 8)} delay=${delay}s token=${token.slice(0, 8)}`);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    listenLog("wake.send-fail", `kind=${kind} id=${accountId.slice(0, 8)} ${message}`);
+  }
+}
+
+export async function onAccountBound(
+  env: Env,
+  account: {
+    id: string;
+    isNew: boolean;
+    pendingSongId?: string | null;
+    wakeAt?: number | null;
+    wakeKind?: string | null;
+    wakeToken?: string | null;
+  },
+): Promise<void> {
+  if (!account.isNew && account.pendingSongId) {
+    listenLog("bind.keep", `id=${account.id.slice(0, 8)} 正在听，只更新资料`);
+    return;
+  }
+  if (!account.isNew && hasValidWake({ wake_token: account.wakeToken, wake_at: account.wakeAt, wake_kind: account.wakeKind })) {
+    listenLog("bind.keep", `id=${account.id.slice(0, 8)} 闹钟仍有效，不重新入队`);
+    return;
+  }
+  await scheduleWake(env, account.id, "start", bindStartDelaySec());
+}
+
+async function clearPending(
+  env: Env,
+  accountId: string,
+  opts: { expired: boolean; message: string; nextListenAt?: number; listenCursor?: number },
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE netease_accounts
+     SET status = ?, last_listen_at = ?, last_error = ?,
+         listening_until = 0, report_at = 0,
+         pending_song_id = NULL, pending_song_name = NULL, pending_artist = NULL,
+         pending_duration = 0, pending_source_id = NULL,
+         next_listen_at = ?, wake_kind = NULL, wake_at = 0, wake_token = NULL
+         ${opts.listenCursor != null ? ", listen_cursor = ?" : ""}
+     WHERE id = ?`,
+  )
+    .bind(
+      opts.expired ? "expired" : "active",
+      nowSec(),
+      opts.message.slice(0, 500),
+      opts.expired ? 0 : opts.nextListenAt || 0,
+      ...(opts.listenCursor != null ? [opts.listenCursor] : []),
+      accountId,
+    )
+    .run();
+}
 
 export async function savePlaylist(env: Env, input: string): Promise<{ name: string; cover: string; trackCount: number }> {
   const playlistId = parsePlaylistId(input);
@@ -229,19 +288,7 @@ export async function savePlaylist(env: Env, input: string): Promise<{ name: str
     await env.DB.batch(chunk);
   }
 
-  const now = nowSec();
-  await env.DB.prepare(
-    `UPDATE netease_accounts
-     SET listen_cursor = 0,
-         next_listen_at = CASE
-           WHEN pending_song_id IS NOT NULL THEN next_listen_at
-           ELSE ? + (ABS(RANDOM()) % ?)
-         END
-     WHERE status = 'active'`,
-  )
-    .bind(now, SCATTER_MAX_SEC)
-    .run();
-
+  await env.DB.prepare(`UPDATE netease_accounts SET listen_cursor = 0 WHERE status = 'active'`).run();
   return { name: info.name, cover: info.cover, trackCount: info.tracks.length };
 }
 
@@ -271,20 +318,6 @@ export async function listTracks(env: Env, limit?: number, offset = 0): Promise<
     .bind(limit, offset)
     .all<PlaylistTrack>();
   return results || [];
-}
-
-export async function scatterIdleAccounts(env: Env, withinSec = SCATTER_MAX_SEC): Promise<number> {
-  const now = nowSec();
-  const result = await env.DB.prepare(
-    `UPDATE netease_accounts
-     SET next_listen_at = ? + (ABS(RANDOM()) % ?)
-     WHERE status = 'active' AND pending_song_id IS NULL AND listening_until <= ?`,
-  )
-    .bind(now, Math.max(1, withinSec), now)
-    .run();
-  const n = Number(result.meta.changes || 0);
-  listenLog("scatter", `idle=${n} within=${withinSec}s`);
-  return n;
 }
 
 async function trimLogs(env: Env) {
@@ -317,162 +350,27 @@ async function writeLog(
     .run();
 }
 
-async function markAccountError(
-  env: Env,
-  accountId: string,
-  expired: boolean,
-  message: string,
-  nextListenAt: number,
-  listenCursor?: number,
-) {
-  await env.DB.prepare(
-    `UPDATE netease_accounts
-     SET status = ?, last_listen_at = ?, last_error = ?,
-         listening_until = 0, report_at = 0,
-         pending_song_id = NULL, pending_song_name = NULL, pending_artist = NULL,
-         pending_duration = 0, pending_source_id = NULL,
-         next_listen_at = ?${listenCursor != null ? ", listen_cursor = ?" : ""}
-     WHERE id = ?`,
-  )
-    .bind(
-      expired ? "expired" : "active",
-      nowSec(),
-      message.slice(0, 500),
-      expired ? 0 : nextListenAt,
-      ...(listenCursor != null ? [listenCursor] : []),
-      accountId,
-    )
-    .run();
-}
-
-async function reportOne(env: Env, accountId: string): Promise<"ok" | "fail" | "skip" | "stale"> {
-  const now = nowSec();
-  const claimed = await env.DB.prepare(
-    `UPDATE netease_accounts
-     SET listening_until = ?
-     WHERE id = ? AND status = 'active' AND pending_song_id IS NOT NULL AND report_at > 0 AND report_at <= ? AND listening_until <= ?`,
-  )
-    .bind(now + CLAIM_SECONDS, accountId, now, now)
-    .run();
-  if (claimed.meta.changes === 0) {
-    listenLog("report.skip", `id=${accountId.slice(0, 8)} 未到期或已上报`);
-    return "skip";
-  }
-
-  const account = await env.DB.prepare(
-    `SELECT id, user_id, cookie_enc, nickname, pending_song_id, pending_song_name, pending_artist,
-            pending_duration, pending_source_id, report_at
-     FROM netease_accounts WHERE id = ?`,
-  )
-    .bind(accountId)
-    .first<AccountRow & { report_at: number }>();
-  if (!account?.pending_song_id) {
-    listenLog("report.skip", `id=${accountId.slice(0, 8)} 没有待上报歌曲`);
-    return "skip";
-  }
-
-  const song = {
-    songId: account.pending_song_id || "",
-    name: account.pending_song_name || "未知歌曲",
-    artist: account.pending_artist || "",
-  };
-
-  if (Number(account.report_at || 0) <= now - REPORT_STALE_SEC) {
-    const message = "上报过期，已跳过";
-    listenLog("report.stale", `${who(account)} song=${song.songId} ${song.name}`);
-    await writeLog(env, account, song, 0, message);
-    await markAccountError(env, account.id, false, message, now + nextGapSec());
-    return "stale";
-  }
-
-  listenLog(
-    "report.start",
-    `${who(account)} song=${song.songId} ${song.name} duration=${account.pending_duration}s`,
-  );
-  try {
-    const cookie = await decryptText(env.SESSION_SECRET, account.cookie_enc);
-    const result = await finishPlaySession(
-      cookie,
-      song.songId,
-      Number(account.pending_duration || 0),
-      account.pending_source_id || undefined,
-    );
-    listenLog("report.done", `${who(account)} ok=${result.ok} ${result.message}`);
-    await writeLog(env, account, song, result.ok ? 1 : 0, result.message);
-    await env.DB.prepare(
-      `UPDATE netease_accounts
-       SET status = 'active', last_listen_at = ?, last_error = ?,
-           listening_until = 0, report_at = 0,
-           pending_song_id = NULL, pending_song_name = NULL, pending_artist = NULL,
-           pending_duration = 0, pending_source_id = NULL,
-           next_listen_at = ?
-       WHERE id = ?`,
-    )
-      .bind(nowSec(), result.ok ? null : result.message.slice(0, 500), nowSec() + nextGapSec(), account.id)
-      .run();
-    return result.ok ? "ok" : "fail";
-  } catch (e) {
-    const expired = e instanceof CookieExpiredError;
-    const message = e instanceof Error ? e.message : String(e);
-    listenLog("report.fail", `${who(account)} expired=${expired} ${message}`);
-    await writeLog(env, account, song, 0, message);
-    await markAccountError(env, account.id, expired, message, nowSec() + nextGapSec());
-    return "fail";
-  }
-}
-
-async function finishDueReports(env: Env, deadline: number): Promise<{ success: number; fail: number; leftover: number }> {
-  const now = nowSec();
-  const dueRow = await env.DB.prepare(
-    `SELECT COUNT(*) as n FROM netease_accounts
-     WHERE pending_song_id IS NOT NULL AND report_at > 0 AND report_at <= ? AND status = 'active' AND listening_until <= ?`,
-  )
-    .bind(now, now)
-    .first<{ n: number }>();
-  const dueCount = Number(dueRow?.n || 0);
-
-  const { results } = await env.DB.prepare(
-    `SELECT id FROM netease_accounts
-     WHERE pending_song_id IS NOT NULL AND report_at > 0 AND report_at <= ? AND status = 'active' AND listening_until <= ?
-     ORDER BY report_at ASC
-     LIMIT ?`,
-  )
-    .bind(now, now, MAX_REPORTS_PER_TICK)
-    .all<{ id: string }>();
-
-  listenLog("report.due", `count=${results?.length || 0} total=${dueCount}`);
-  const { outcomes, leftover: budgetLeft } = await mapPool(results || [], (row) => reportOne(env, row.id), deadline);
-  let success = 0;
-  let fail = 0;
-  for (const outcome of outcomes) {
-    if (outcome === "ok") success += 1;
-    else if (outcome === "fail" || outcome === "stale") fail += 1;
-  }
-  const leftover = budgetLeft + Math.max(0, dueCount - (results?.length || 0));
-  return { success, fail, leftover };
-}
-
 async function startOneAccount(
   env: Env,
   account: AccountRow,
   playlistId: string,
   trackCount: number,
-  deadline: number,
-): Promise<{ started: number; fail: number }> {
+): Promise<"started" | "locked" | "expired" | "fail"> {
   const claimed = await env.DB.prepare(
     `UPDATE netease_accounts
      SET listening_until = ?
-     WHERE id = ? AND status = 'active' AND pending_song_id IS NULL AND listening_until <= ?`,
+     WHERE id = ? AND status = 'active' AND pending_song_id IS NULL AND listening_until <= ? AND wake_token = ?`,
   )
-    .bind(nowSec() + CLAIM_SECONDS, account.id, nowSec())
+    .bind(nowSec() + CLAIM_SECONDS, account.id, nowSec(), account.wake_token)
     .run();
   if (claimed.meta.changes === 0) {
-    listenLog("start.skip", `${who(account)} 未抢到锁（同时只听一首）`);
-    return { started: 0, fail: 0 };
+    listenLog("start.skip", `${who(account)} 未抢到锁`);
+    return "locked";
   }
 
   const n = Math.max(trackCount, 1);
   let idx = Number(account.listen_cursor || 0) % n;
+  const deadline = Date.now() + START_BUDGET_MS;
 
   let cookie: string;
   let uid = "";
@@ -485,8 +383,10 @@ async function startOneAccount(
     const expired = e instanceof CookieExpiredError;
     const message = e instanceof Error ? e.message : String(e);
     listenLog("start.fail", `${who(account)} expired=${expired} ${expired ? "个人资料接口判定登录失效" : message}`);
-    await markAccountError(env, account.id, expired, message, expired ? 0 : nowSec() + nextGapSec(), idx);
-    return { started: 0, fail: 1 };
+    await clearPending(env, account.id, { expired, message, listenCursor: idx });
+    if (expired) return "expired";
+    await scheduleWake(env, account.id, "start", nextGapSec());
+    return "fail";
   }
 
   let artistId = String(account.artist_id || "");
@@ -503,13 +403,12 @@ async function startOneAccount(
   let ownSkipped = 0;
   while (scanned < n && playFails < MAX_SONG_TRIES) {
     if (overBudget(deadline)) {
-      await env.DB.prepare(
-        `UPDATE netease_accounts SET listening_until = 0, listen_cursor = ?, next_listen_at = ? WHERE id = ?`,
-      )
-        .bind(idx, nowSec(), account.id)
+      await env.DB.prepare(`UPDATE netease_accounts SET listening_until = 0, listen_cursor = ? WHERE id = ?`)
+        .bind(idx, account.id)
         .run();
-      listenLog("start.defer", `${who(account)} 本轮超时，游标=${idx} 留给下一轮`);
-      return { started: 0, fail: 0 };
+      await scheduleWake(env, account.id, "start", 8);
+      listenLog("start.defer", `${who(account)} 本轮超时，游标=${idx} 稍后重试`);
+      return "started";
     }
 
     scanned += 1;
@@ -553,15 +452,19 @@ async function startOneAccount(
         continue;
       }
 
+      const token = newId();
       const startedAt = nowSec();
-      const reportAt = startedAt + Math.max(1, Math.round(durationS));
-      const gap = nextGapSec();
+      const duration = Math.round(durationS);
+      const reportAt = startedAt + Math.max(1, duration);
+      const delay = reportDelaySec(duration);
+      const wakeAt = startedAt + delay;
       await env.DB.prepare(
         `UPDATE netease_accounts
          SET status = 'active', last_listen_at = ?, last_error = NULL, listen_cursor = ?,
              pending_song_id = ?, pending_song_name = ?, pending_artist = ?,
              pending_duration = ?, pending_source_id = ?,
-             report_at = ?, listening_until = ?, next_listen_at = ?
+             report_at = ?, listening_until = 0,
+             wake_kind = 'report', wake_at = ?, wake_token = ?
          WHERE id = ?`,
       )
         .bind(
@@ -570,30 +473,41 @@ async function startOneAccount(
           track.songId,
           track.name,
           track.artist,
-          Math.round(durationS),
+          duration,
           playlistId,
           reportAt,
-          reportAt,
-          reportAt + gap,
+          wakeAt,
+          token,
           account.id,
         )
         .run();
       await env.DB.prepare("UPDATE playlist_meta SET cursor = ?, updated_at = ? WHERE id = 1")
         .bind(idx, startedAt)
         .run();
+      try {
+        await sendWake(
+          env,
+          "report",
+          { type: "report", accountId: account.id, token, songId: track.songId },
+          delay,
+        );
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        listenLog("wake.send-fail", `${who(account)} report ${message}`);
+      }
       listenLog(
         "start.ok",
-        `${who(account)} duration=${Math.round(durationS)}s reportAt=${new Date(reportAt * 1000).toISOString()} gap=${gap}s`,
+        `${who(account)} duration=${duration}s reportAt=${new Date(reportAt * 1000).toISOString()} delay=${delay}s`,
       );
-      return { started: 1, fail: 0 };
+      return "started";
     } catch (e) {
       const expired = e instanceof CookieExpiredError;
       const message = e instanceof Error ? e.message : String(e);
       await writeLog(env, account, track, 0, message);
       if (expired) {
         listenLog("start.fail", `${who(account)} expired=true ${message}`);
-        await markAccountError(env, account.id, true, message, 0, nextCursor);
-        return { started: 0, fail: 1 };
+        await clearPending(env, account.id, { expired: true, message, listenCursor: nextCursor });
+        return "expired";
       }
       listenLog("start.fail", `${who(account)} expired=false ${message} 跳到下一首 next=${nextCursor}`);
       await env.DB.prepare("UPDATE netease_accounts SET listen_cursor = ?, last_error = ? WHERE id = ?")
@@ -605,57 +519,284 @@ async function startOneAccount(
   }
 
   const message = ownSkipped >= n ? "歌单里没有可听的他人歌曲" : "连续几首无法开听，稍后再试";
-  await markAccountError(env, account.id, false, message, nowSec() + nextGapSec(), idx);
-  return { started: 0, fail: 1 };
+  await clearPending(env, account.id, { expired: false, message, listenCursor: idx });
+  await scheduleWake(env, account.id, "start", nextGapSec());
+  return "fail";
 }
 
-async function startDueAccounts(
-  env: Env,
-  playlistId: string,
-  trackCount: number,
-  deadline: number,
-): Promise<{ started: number; fail: number; leftover: number }> {
-  const now = nowSec();
-  await env.DB.prepare(
-    `UPDATE netease_accounts
-     SET next_listen_at = ? + (ABS(RANDOM()) % ?)
-     WHERE status = 'active' AND pending_song_id IS NULL AND listening_until <= ? AND next_listen_at = 0`,
-  )
-    .bind(now, SCATTER_MAX_SEC, now)
-    .run();
-
-  const dueRow = await env.DB.prepare(
-    `SELECT COUNT(*) as n FROM netease_accounts
-     WHERE status = 'active' AND pending_song_id IS NULL AND listening_until <= ? AND next_listen_at > 0 AND next_listen_at <= ?`,
-  )
-    .bind(now, now)
-    .first<{ n: number }>();
-  const dueCount = Number(dueRow?.n || 0);
-
-  const { results } = await env.DB.prepare(
-    `SELECT id, user_id, cookie_enc, nickname, listen_cursor, artist_id
-     FROM netease_accounts
-     WHERE status = 'active' AND pending_song_id IS NULL AND listening_until <= ? AND next_listen_at > 0 AND next_listen_at <= ?
-     ORDER BY next_listen_at ASC
-     LIMIT ?`,
-  )
-    .bind(now, now, MAX_STARTS_PER_TICK)
-    .all<AccountRow>();
-
-  listenLog("start.due", `count=${results?.length || 0} total=${dueCount} trackCount=${trackCount}`);
-  const { outcomes, leftover: budgetLeft } = await mapPool(
-    results || [],
-    (account) => startOneAccount(env, account, playlistId, trackCount, deadline),
-    deadline,
-  );
-  let started = 0;
-  let fail = 0;
-  for (const row of outcomes) {
-    started += row.started;
-    fail += row.fail;
+async function handleStart(env: Env, body: ListenQueueMessage): Promise<QueueAction> {
+  const account = await loadAccount(env, body.accountId);
+  if (!account) {
+    listenLog("start.skip", `id=${body.accountId.slice(0, 8)} 账号已删除`);
+    return "ack";
   }
-  const leftover = budgetLeft + Math.max(0, dueCount - (results?.length || 0));
-  return { started, fail, leftover };
+  if (account.wake_token !== body.token || account.wake_kind !== "start") {
+    listenLog("start.stale", `${who(account)} 旧闹钟`);
+    return "ack";
+  }
+  if (account.status !== "active") {
+    listenLog("start.skip", `${who(account)} status=${account.status}`);
+    return "ack";
+  }
+  if (account.pending_song_id) {
+    listenLog("start.skip", `${who(account)} 已在听 ${account.pending_song_id}`);
+    return "ack";
+  }
+
+  const meta = await getPlaylistMeta(env);
+  if (!meta?.listen_enabled) {
+    listenLog("start.paused", `${who(account)} 互助听歌已关闭`);
+    return "ack";
+  }
+  if (!meta.playlist_id || !meta.track_count) {
+    listenLog("start.skip", `${who(account)} 尚未设置歌单`);
+    return "ack";
+  }
+
+  const result = await startOneAccount(env, account, meta.playlist_id, meta.track_count);
+  if (result === "locked") {
+    const again = await loadAccount(env, account.id);
+    if (!again || again.wake_token !== body.token || again.pending_song_id) return "ack";
+    return "retry";
+  }
+  return "ack";
+}
+
+async function handleReport(env: Env, body: ListenQueueMessage, attempts: number): Promise<QueueAction> {
+  const account = await loadAccount(env, body.accountId);
+  if (!account) {
+    listenLog("report.skip", `id=${body.accountId.slice(0, 8)} 账号已删除`);
+    return "ack";
+  }
+  if (account.wake_token !== body.token || account.wake_kind !== "report") {
+    listenLog("report.stale", `${who(account)} 旧闹钟`);
+    return "ack";
+  }
+  if (account.status !== "active") {
+    listenLog("report.skip", `${who(account)} status=${account.status}`);
+    return "ack";
+  }
+  if (!account.pending_song_id) {
+    listenLog("report.skip", `${who(account)} 没有待上报歌曲`);
+    return "ack";
+  }
+  if (body.songId && body.songId !== account.pending_song_id) {
+    listenLog("report.stale", `${who(account)} song=${body.songId} pending=${account.pending_song_id}`);
+    return "ack";
+  }
+
+  const now = nowSec();
+  if (Number(account.report_at || 0) > now) {
+    listenLog("report.early", `${who(account)} in=${account.report_at - now}s`);
+    return "retry";
+  }
+
+  const claimed = await env.DB.prepare(
+    `UPDATE netease_accounts
+     SET listening_until = ?
+     WHERE id = ? AND status = 'active' AND pending_song_id IS NOT NULL AND report_at > 0 AND report_at <= ? AND listening_until <= ? AND wake_token = ?`,
+  )
+    .bind(now + CLAIM_SECONDS, account.id, now, now, body.token)
+    .run();
+  if (claimed.meta.changes === 0) {
+    const again = await loadAccount(env, account.id);
+    if (!again || again.wake_token !== body.token || !again.pending_song_id) return "ack";
+    return "retry";
+  }
+
+  const song = {
+    songId: account.pending_song_id || "",
+    name: account.pending_song_name || "未知歌曲",
+    artist: account.pending_artist || "",
+  };
+
+  const meta = await getPlaylistMeta(env);
+  const listenEnabled = !!meta?.listen_enabled;
+
+  if (Number(account.report_at || 0) <= now - REPORT_STALE_SEC) {
+    const message = "上报过期，已跳过";
+    listenLog("report.stale", `${who(account)} song=${song.songId} ${song.name}`);
+    await writeLog(env, account, song, 0, message);
+    await clearPending(env, account.id, { expired: false, message });
+    if (listenEnabled) await scheduleWake(env, account.id, "start", nextGapSec());
+    return "ack";
+  }
+
+  listenLog("report.start", `${who(account)} song=${song.songId} ${song.name} duration=${account.pending_duration}s`);
+  try {
+    const cookie = await decryptText(env.SESSION_SECRET, account.cookie_enc);
+    const result = await finishPlaySession(
+      cookie,
+      song.songId,
+      Number(account.pending_duration || 0),
+      account.pending_source_id || undefined,
+    );
+    listenLog("report.done", `${who(account)} ok=${result.ok} ${result.message}`);
+    await writeLog(env, account, song, result.ok ? 1 : 0, result.message);
+    const gap = nextGapSec();
+    await env.DB.prepare(
+      `UPDATE netease_accounts
+       SET status = 'active', last_listen_at = ?, last_error = ?,
+           listening_until = 0, report_at = 0,
+           pending_song_id = NULL, pending_song_name = NULL, pending_artist = NULL,
+           pending_duration = 0, pending_source_id = NULL
+       WHERE id = ?`,
+    )
+      .bind(nowSec(), result.ok ? null : result.message.slice(0, 500), account.id)
+      .run();
+    if (listenEnabled) await scheduleWake(env, account.id, "start", gap);
+    else {
+      await env.DB.prepare(
+        `UPDATE netease_accounts SET wake_kind = NULL, wake_at = 0, wake_token = NULL, next_listen_at = 0 WHERE id = ?`,
+      )
+        .bind(account.id)
+        .run();
+    }
+    return "ack";
+  } catch (e) {
+    const expired = e instanceof CookieExpiredError;
+    const message = e instanceof Error ? e.message : String(e);
+    listenLog("report.fail", `${who(account)} expired=${expired} ${message}`);
+    await writeLog(env, account, song, 0, message);
+    if (expired) {
+      await clearPending(env, account.id, { expired: true, message });
+      return "ack";
+    }
+    if (attempts < 3) return "retry";
+    await clearPending(env, account.id, { expired: false, message });
+    if (listenEnabled) await scheduleWake(env, account.id, "start", nextGapSec());
+    return "ack";
+  }
+}
+
+function retryDelayFor(body: ListenQueueMessage, reportAt?: number): number {
+  if (body.type === "report" && reportAt && reportAt > nowSec()) {
+    return clampDelay(reportAt - nowSec() + 1);
+  }
+  return body.type === "report" ? 20 : 30;
+}
+
+export async function handleListenQueue(env: Env, batch: MessageBatch<ListenQueueMessage>): Promise<void> {
+  listenLog("queue.batch", `queue=${batch.queue} n=${batch.messages.length}`);
+  for (const msg of batch.messages) {
+    const body = msg.body;
+    if (!body?.accountId || !body.token || (body.type !== "start" && body.type !== "report")) {
+      listenLog("queue.bad", `id=${msg.id}`);
+      msg.ack();
+      continue;
+    }
+    try {
+      const action = body.type === "report" ? await handleReport(env, body, msg.attempts) : await handleStart(env, body);
+      if (action === "retry") {
+        const account = await loadAccount(env, body.accountId);
+        msg.retry({ delaySeconds: retryDelayFor(body, account?.report_at) });
+      } else {
+        msg.ack();
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      listenLog("queue.fail", `type=${body.type} id=${body.accountId.slice(0, 8)} ${message}`);
+      msg.retry({ delaySeconds: body.type === "report" ? 20 : 45 });
+    }
+  }
+}
+
+type RepairRow = {
+  id: string;
+  pending_song_id: string | null;
+  report_at: number;
+};
+
+async function repairStuckWakes(
+  env: Env,
+  opts: { graceSec: number; scatterMax: number; forceIdleStarts?: boolean },
+): Promise<{ started: number; reported: number; leftoverStarts: number; leftoverReports: number; skipped?: string }> {
+  const meta = await getPlaylistMeta(env);
+  if (!meta) return { started: 0, reported: 0, leftoverStarts: 0, leftoverReports: 0, skipped: "尚未初始化" };
+
+  const now = nowSec();
+  const staleBefore = now - Math.max(0, opts.graceSec);
+  const scatter = Math.max(1, opts.scatterMax);
+
+  const dueReports = await env.DB.prepare(
+    `SELECT COUNT(*) as n FROM netease_accounts
+     WHERE status = 'active' AND pending_song_id IS NOT NULL AND (wake_at = 0 OR wake_at < ?)`,
+  )
+    .bind(staleBefore)
+    .first<{ n: number }>();
+
+  let dueStarts = 0;
+  if (meta.listen_enabled && meta.playlist_id && meta.track_count) {
+    if (opts.forceIdleStarts) {
+      const row = await env.DB.prepare(
+        `SELECT COUNT(*) as n FROM netease_accounts WHERE status = 'active' AND pending_song_id IS NULL`,
+      ).first<{ n: number }>();
+      dueStarts = Number(row?.n || 0);
+    } else {
+      const row = await env.DB.prepare(
+        `SELECT COUNT(*) as n FROM netease_accounts
+         WHERE status = 'active' AND pending_song_id IS NULL AND (wake_at = 0 OR wake_at < ?)`,
+      )
+        .bind(staleBefore)
+        .first<{ n: number }>();
+      dueStarts = Number(row?.n || 0);
+    }
+  }
+
+  const { results: reportRows } = await env.DB.prepare(
+    `SELECT id, pending_song_id, report_at FROM netease_accounts
+     WHERE status = 'active' AND pending_song_id IS NOT NULL AND (wake_at = 0 OR wake_at < ?)
+     ORDER BY wake_at ASC LIMIT ?`,
+  )
+    .bind(staleBefore, MAX_REPAIR_PER_TICK)
+    .all<RepairRow>();
+
+  let started = 0;
+  let reported = 0;
+  const startBudget = Math.max(0, MAX_REPAIR_PER_TICK - (reportRows?.length || 0));
+
+  for (const row of reportRows || []) {
+    const delay = randInt(0, scatter);
+    if (Number(row.report_at || 0) > 0 && Number(row.report_at) <= now - REPORT_STALE_SEC) {
+      await clearPending(env, row.id, { expired: false, message: "上报过期，已跳过" });
+      if (meta.listen_enabled && meta.playlist_id) {
+        await scheduleWake(env, row.id, "start", delay || bindStartDelaySec());
+        started += 1;
+      }
+      continue;
+    }
+    await scheduleWake(env, row.id, "report", delay, { songId: row.pending_song_id || undefined });
+    reported += 1;
+  }
+
+  if (meta.listen_enabled && meta.playlist_id && meta.track_count && startBudget > 0) {
+    const startQuery = opts.forceIdleStarts
+      ? `SELECT id, pending_song_id, report_at FROM netease_accounts
+         WHERE status = 'active' AND pending_song_id IS NULL
+         ORDER BY wake_at ASC LIMIT ?`
+      : `SELECT id, pending_song_id, report_at FROM netease_accounts
+         WHERE status = 'active' AND pending_song_id IS NULL AND (wake_at = 0 OR wake_at < ?)
+         ORDER BY wake_at ASC LIMIT ?`;
+    const stmt = env.DB.prepare(startQuery);
+    const { results: startRows } = opts.forceIdleStarts
+      ? await stmt.bind(startBudget).all<RepairRow>()
+      : await stmt.bind(staleBefore, startBudget).all<RepairRow>();
+    for (const row of startRows || []) {
+      await scheduleWake(env, row.id, "start", randInt(0, scatter));
+      started += 1;
+    }
+  }
+
+  const leftoverReports = Math.max(0, Number(dueReports?.n || 0) - reported);
+  const leftoverStarts = Math.max(0, dueStarts - started);
+  let skipped: string | undefined;
+  if (!meta.listen_enabled) skipped = "互助听歌已关闭（仍会补到期上报）";
+  else if (!meta.playlist_id || !meta.track_count) skipped = "尚未设置歌单";
+  listenLog(
+    "repair.done",
+    `started=${started} reported=${reported} leftoverStarts=${leftoverStarts} leftoverReports=${leftoverReports}${skipped ? ` skipped=${skipped}` : ""}`,
+  );
+  return { started, reported, leftoverStarts, leftoverReports, skipped };
 }
 
 export async function tickListen(env: Env): Promise<{
@@ -669,7 +810,6 @@ export async function tickListen(env: Env): Promise<{
   wallMs: number;
 }> {
   const t0 = Date.now();
-  const deadline = t0 + TICK_BUDGET_MS;
   const empty = {
     reported: 0,
     started: 0,
@@ -680,87 +820,43 @@ export async function tickListen(env: Env): Promise<{
     wallMs: 0,
   };
 
-  const meta = await getPlaylistMeta(env);
-  if (!meta) {
-    listenLog("tick.skip", "尚未初始化");
-    empty.wallMs = Date.now() - t0;
-    await writeHeartbeat(env, { at: nowSec(), status: "ok", ...empty, message: "尚未初始化" });
-    return { skipped: "尚未初始化", ...empty };
-  }
-
-  listenLog(
-    "tick.begin",
-    `enabled=${!!meta.listen_enabled} playlist=${meta.playlist_id || "-"} tracks=${meta.track_count || 0} budget=${TICK_BUDGET_MS}ms`,
-  );
-
-  let reports = { success: 0, fail: 0, leftover: 0 };
-  let starts = { started: 0, fail: 0, leftover: 0 };
-  let skipped: string | undefined;
+  listenLog("tick.begin", `repair grace=${REPAIR_GRACE_SEC}s scatter=${REPAIR_SCATTER_MAX_SEC}s`);
   let status: CronHeartbeat["status"] = "ok";
+  let result = { ...empty, skipped: undefined as string | undefined };
 
   try {
-    reports = await finishDueReports(env, deadline);
-
-    if (!meta.listen_enabled) {
-      skipped = "互助听歌已关闭（已结算进行中的上报）";
-    } else if (!meta.playlist_id || !meta.track_count) {
-      skipped = "尚未设置歌单";
-    } else {
-      const owner = newId();
-      if (await acquireWorkOrSkip(env, owner, "tick")) {
-        try {
-          starts = await startDueAccounts(env, meta.playlist_id, meta.track_count, deadline);
-        } finally {
-          await releaseWork(env, owner);
-          listenLog("work.release", `owner=${owner.slice(0, 8)} 进入等待或不忙`);
-        }
-      } else {
-        status = "busy";
-        skipped = "上一次开听还在跑";
-        const now = nowSec();
-        const dueRow = await env.DB.prepare(
-          `SELECT COUNT(*) as n FROM netease_accounts
-           WHERE status = 'active' AND pending_song_id IS NULL AND listening_until <= ? AND next_listen_at > 0 AND next_listen_at <= ?`,
-        )
-          .bind(now, now)
-          .first<{ n: number }>();
-        starts.leftover = Number(dueRow?.n || 0);
-      }
-    }
-
-    if (shouldTrimLogs() && !overBudget(deadline)) {
-      await trimLogs(env);
-    }
+    const repair = await repairStuckWakes(env, { graceSec: REPAIR_GRACE_SEC, scatterMax: REPAIR_SCATTER_MAX_SEC });
+    result = {
+      skipped: repair.skipped,
+      reported: repair.reported,
+      started: repair.started,
+      success: 0,
+      fail: 0,
+      leftoverReports: repair.leftoverReports,
+      leftoverStarts: repair.leftoverStarts,
+      wallMs: 0,
+    };
+    if (shouldTrimLogs()) await trimLogs(env);
   } catch (e) {
     status = "error";
-    skipped = e instanceof Error ? e.message : String(e);
-    listenLog("tick.fail", skipped);
+    result.skipped = e instanceof Error ? e.message : String(e);
+    listenLog("tick.fail", result.skipped);
   }
 
-  const wallMs = Date.now() - t0;
-  const result = {
-    skipped,
-    reported: reports.success + reports.fail,
-    started: starts.started,
-    success: reports.success,
-    fail: reports.fail + starts.fail,
-    leftoverReports: reports.leftover,
-    leftoverStarts: starts.leftover,
-    wallMs,
-  };
+  result.wallMs = Date.now() - t0;
   listenLog(
     "tick.done",
-    `started=${result.started} reported=${result.reported} success=${result.success} fail=${result.fail} leftoverStarts=${result.leftoverStarts} leftoverReports=${result.leftoverReports} wallMs=${wallMs}${skipped ? ` skipped=${skipped}` : ""}`,
+    `started=${result.started} reported=${result.reported} leftoverStarts=${result.leftoverStarts} leftoverReports=${result.leftoverReports} wallMs=${result.wallMs}${result.skipped ? ` skipped=${result.skipped}` : ""}`,
   );
   await writeHeartbeat(env, {
     at: nowSec(),
     status,
-    wallMs,
+    wallMs: result.wallMs,
     started: result.started,
     reported: result.reported,
     leftoverStarts: result.leftoverStarts,
     leftoverReports: result.leftoverReports,
-    message: skipped,
+    message: result.skipped,
   });
   return result;
 }
@@ -778,6 +874,11 @@ export async function recordCronError(env: Env, message: string, wallMs: number)
   });
 }
 
+export async function onListenEnabledChange(env: Env, enabled: boolean): Promise<void> {
+  if (!enabled) return;
+  await repairStuckWakes(env, { graceSec: 0, scatterMax: BIND_START_MAX_SEC });
+}
+
 export async function kickListen(env: Env): Promise<{
   skipped?: string;
   scattered: number;
@@ -789,8 +890,33 @@ export async function kickListen(env: Env): Promise<{
   leftoverStarts: number;
   wallMs: number;
 }> {
-  const scattered = await scatterIdleAccounts(env, 1);
-  listenLog("kick", `scattered=${scattered}`);
-  const tick = await tickListen(env);
-  return { ...tick, scattered };
+  const t0 = Date.now();
+  const repair = await repairStuckWakes(env, {
+    graceSec: 0,
+    scatterMax: KICK_SCATTER_MAX_SEC,
+    forceIdleStarts: true,
+  });
+  const wallMs = Date.now() - t0;
+  listenLog("kick", `started=${repair.started} reported=${repair.reported}`);
+  await writeHeartbeat(env, {
+    at: nowSec(),
+    status: "ok",
+    wallMs,
+    started: repair.started,
+    reported: repair.reported,
+    leftoverStarts: repair.leftoverStarts,
+    leftoverReports: repair.leftoverReports,
+    message: repair.skipped,
+  });
+  return {
+    skipped: repair.skipped,
+    scattered: repair.started + repair.reported,
+    reported: repair.reported,
+    started: repair.started,
+    success: 0,
+    fail: 0,
+    leftoverReports: repair.leftoverReports,
+    leftoverStarts: repair.leftoverStarts,
+    wallMs,
+  };
 }
