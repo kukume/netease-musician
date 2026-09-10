@@ -1,5 +1,5 @@
 import { err } from "./auth";
-import { ensureStorageSchema } from "./schema";
+import { applyPendingMigrations, ensureStorageSchema } from "./schema";
 
 export function hasDbBinding(env: Env): boolean {
   return typeof env.DB?.prepare === "function";
@@ -24,6 +24,11 @@ export async function ensureSchema(env: Env): Promise<boolean> {
   if (schemaReady) return true;
   if (!hasDbBinding(env)) return false;
   if (await isDatabaseReady(env)) {
+    try {
+      await applyPendingMigrations(env.DB);
+    } catch (error) {
+      console.error("[db] migrate failed", error);
+    }
     schemaReady = true;
     return true;
   }

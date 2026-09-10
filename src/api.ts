@@ -20,15 +20,23 @@ import {
 } from "./auth";
 import {
   checkQrcode,
+  CookieExpiredError,
   fetchAccount,
   getQrcode,
+  loginBySms,
+  parseNeteaseCookie,
+  QrBlockedError,
   QrWaitError,
+  sendSmsCode,
 } from "./netease";
+import { applyPendingMigrations, listMigrations } from "./schema";
 import { getCronHeartbeat, getPlaylistMeta, kickListen, listTracks, randomListenAt, savePlaylist } from "./listen";
 import { qrToSvg } from "./qr";
 import { publicCapConfig, verifyCapToken } from "./cap";
 
 const PAGE_SIZE = 15;
+const SMS_TTL_SEC = 10 * 60;
+const SMS_SEND_GAP_SEC = 60;
 
 function pageParams(request: Request, defaultSize = PAGE_SIZE) {
   const url = new URL(request.url);
@@ -39,6 +47,57 @@ function pageParams(request: Request, defaultSize = PAGE_SIZE) {
 
 function publicUser(u: User) {
   return { id: u.id, username: u.username, role: u.role, status: u.status, createdAt: u.created_at };
+}
+
+async function upsertNeteaseAccount(
+  env: Env,
+  userId: string,
+  cookie: string,
+  profile: { uid: string; nickname: string; avatar: string },
+) {
+  const cookieEnc = await encryptText(env.SESSION_SECRET, cookie);
+  const nextAt = randomListenAt();
+  const existing = profile.uid
+    ? await env.DB.prepare("SELECT id FROM netease_accounts WHERE user_id = ? AND netease_uid = ?")
+        .bind(userId, profile.uid)
+        .first<{ id: string }>()
+    : null;
+  if (existing) {
+    await env.DB.prepare(
+      `UPDATE netease_accounts
+       SET nickname = ?, avatar = ?, cookie_enc = ?, status = 'active', last_error = NULL,
+           next_listen_at = CASE WHEN pending_song_id IS NOT NULL THEN next_listen_at ELSE ? END
+       WHERE id = ?`,
+    )
+      .bind(profile.nickname, profile.avatar, cookieEnc, nextAt, existing.id)
+      .run();
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO netease_accounts (id, user_id, netease_uid, nickname, avatar, cookie_enc, status, created_at, next_listen_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+    )
+      .bind(newId(), userId, profile.uid || null, profile.nickname, profile.avatar, cookieEnc, nowSec(), nextAt)
+      .run();
+  }
+  return profile;
+}
+
+async function resolveNeteaseProfile(cookie: string, loginJson?: Record<string, unknown>) {
+  try {
+    return await fetchAccount(cookie);
+  } catch {
+    const p = (loginJson || {}) as Record<string, unknown>;
+    const nested = (p.profile as Record<string, unknown> | undefined) || {};
+    const account = (p.account as Record<string, unknown> | undefined) || {};
+    const data = (p.data as Record<string, unknown> | undefined) || {};
+    const uid = String(nested.userId || p.userId || account.id || data.userId || "");
+    if (!uid) throw new Error("未获取到网易云账号信息");
+    return {
+      uid,
+      nickname: String(nested.nickname || p.nickname || data.nickname || "网易云用户"),
+      avatar: String(nested.avatarUrl || p.avatarUrl || data.avatarUrl || ""),
+    };
+  }
 }
 
 export async function handleApi(request: Request, env: Env): Promise<Response> {
@@ -65,6 +124,9 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     if (method === "GET" && path.startsWith("/api/netease/qrcode/")) {
       return pollQr(env, request, path.slice("/api/netease/qrcode/".length));
     }
+    if (method === "POST" && path === "/api/netease/cookie") return bindCookie(env, request);
+    if (method === "POST" && path === "/api/netease/sms/send") return sendSms(env, request);
+    if (method === "POST" && path === "/api/netease/sms/login") return loginSms(env, request);
     if (method === "GET" && path === "/api/netease/accounts") return listAccounts(env, request);
     if (method === "DELETE" && path.startsWith("/api/netease/accounts/")) {
       return deleteAccount(env, request, path.slice("/api/netease/accounts/".length));
@@ -87,6 +149,8 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     if (method === "POST" && path === "/api/admin/playlist/refresh") return refreshPlaylist(env, request);
     if (method === "PUT" && path === "/api/admin/listen") return setListen(env, request);
     if (method === "POST" && path === "/api/admin/listen/run") return manualListen(env, request);
+    if (method === "GET" && path === "/api/admin/migrate") return listDbMigrations(env, request);
+    if (method === "POST" && path === "/api/admin/migrate") return runDbMigrations(env, request);
     if (method === "GET" && path === "/api/admin/logs") return adminLogs(env, request);
 
     return err("接口不存在", 404);
@@ -272,15 +336,20 @@ async function pollQr(env: Env, request: Request, id: string) {
       cookie: string;
       url: string;
       status: string;
+      message: string | null;
       expires_at: number;
     }>();
   if (!row) return err("二维码不存在", 404);
   if (row.status === "ok") return ok({ status: "ok", message: "绑定成功" });
+  if (row.status === "expired") return ok({ status: "expired", message: row.message || "二维码已过期，请改用 Cookie" });
+  if (row.status === "error" || row.status === "verify") {
+    return ok({ status: row.status, message: row.message || "扫码失败，请改用 Cookie" });
+  }
   if (nowSec() > row.expires_at) {
     await env.DB.prepare("UPDATE qr_sessions SET status = 'expired', message = ? WHERE id = ?")
       .bind("二维码已过期", id)
       .run();
-    return ok({ status: "expired", message: "二维码已过期，请刷新" });
+    return ok({ status: "expired", message: "二维码已过期，请改用手机验证码或 Cookie" });
   }
   try {
     const login = await checkQrcode({
@@ -289,43 +358,8 @@ async function pollQr(env: Env, request: Request, id: string) {
       chainId: row.chain_id,
       cookie: row.cookie,
     });
-    let profile = { uid: "", nickname: "网易云用户", avatar: "" };
-    try {
-      profile = await fetchAccount(login.cookie);
-    } catch {
-      const p = (login.profile || {}) as Record<string, unknown>;
-      const nested = (p.profile as Record<string, unknown> | undefined) || {};
-      const account = (p.account as Record<string, unknown> | undefined) || {};
-      profile = {
-        uid: String(nested.userId || p.userId || account.id || p.userId || ""),
-        nickname: String(nested.nickname || p.nickname || "网易云用户"),
-        avatar: String(nested.avatarUrl || p.avatarUrl || ""),
-      };
-    }
-    const cookieEnc = await encryptText(env.SESSION_SECRET, login.cookie);
-    const nextAt = randomListenAt();
-    const existing = profile.uid
-      ? await env.DB.prepare("SELECT id FROM netease_accounts WHERE user_id = ? AND netease_uid = ?")
-          .bind(user.id, profile.uid)
-          .first<{ id: string }>()
-      : null;
-    if (existing) {
-      await env.DB.prepare(
-        `UPDATE netease_accounts
-         SET nickname = ?, avatar = ?, cookie_enc = ?, status = 'active', last_error = NULL,
-             next_listen_at = CASE WHEN pending_song_id IS NOT NULL THEN next_listen_at ELSE ? END
-         WHERE id = ?`,
-      )
-        .bind(profile.nickname, profile.avatar, cookieEnc, nextAt, existing.id)
-        .run();
-    } else {
-      await env.DB.prepare(
-        `INSERT INTO netease_accounts (id, user_id, netease_uid, nickname, avatar, cookie_enc, status, created_at, next_listen_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
-      )
-        .bind(newId(), user.id, profile.uid || null, profile.nickname, profile.avatar, cookieEnc, nowSec(), nextAt)
-        .run();
-    }
+    const profile = await resolveNeteaseProfile(login.cookie, login.profile);
+    await upsertNeteaseAccount(env, user.id, login.cookie, profile);
     await env.DB.prepare("UPDATE qr_sessions SET status = 'ok', message = ?, cookie = '' WHERE id = ?")
       .bind("绑定成功", id)
       .run();
@@ -338,11 +372,95 @@ async function pollQr(env: Env, request: Request, id: string) {
         .run();
       return ok({ status, message: e.message });
     }
+    const kind = e instanceof QrBlockedError && e.kind === "verify" ? "verify" : "error";
     const message = e instanceof Error ? e.message : String(e);
-    await env.DB.prepare("UPDATE qr_sessions SET status = 'error', message = ? WHERE id = ?")
-      .bind(message, id)
+    await env.DB.prepare("UPDATE qr_sessions SET status = ?, message = ? WHERE id = ?")
+      .bind(kind, message, id)
       .run();
-    return err(message);
+    return ok({ status: kind, message });
+  }
+}
+
+async function bindCookie(env: Env, request: Request) {
+  const user = await requireUser(env, request);
+  if (user instanceof Response) return user;
+  const body = await readJson<{ cookie?: string }>(request);
+  let cookie: string;
+  try {
+    cookie = parseNeteaseCookie(body.cookie || "");
+  } catch (e) {
+    return err(e instanceof Error ? e.message : "Cookie 无效");
+  }
+  try {
+    const profile = await fetchAccount(cookie);
+    await upsertNeteaseAccount(env, user.id, cookie, profile);
+    return ok({ message: "绑定成功", profile });
+  } catch (e) {
+    return err(e instanceof CookieExpiredError ? "Cookie 无效或已过期，请重新复制登录后的 Cookie" : e instanceof Error ? e.message : "绑定失败");
+  }
+}
+
+async function sendSms(env: Env, request: Request) {
+  const user = await requireUser(env, request);
+  if (user instanceof Response) return user;
+  const body = await readJson<{ phone?: string; countrycode?: string }>(request);
+  const last = await env.DB.prepare("SELECT created_at FROM sms_sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
+    .bind(user.id)
+    .first<{ created_at: number }>();
+  if (last && nowSec() - last.created_at < SMS_SEND_GAP_SEC) {
+    return err("发送太频繁，请稍后再试");
+  }
+  let session: { cookie: string; phone: string; countrycode: string };
+  try {
+    session = await sendSmsCode(body.phone || "", body.countrycode || "86");
+  } catch (e) {
+    return err(e instanceof Error ? e.message : "发送验证码失败");
+  }
+  await env.DB.prepare("DELETE FROM sms_sessions WHERE user_id = ? OR expires_at < ?")
+    .bind(user.id, nowSec())
+    .run();
+  const id = newId();
+  await env.DB.prepare(
+    `INSERT INTO sms_sessions (id, user_id, phone, countrycode, cookie, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, user.id, session.phone, session.countrycode, session.cookie, nowSec(), nowSec() + SMS_TTL_SEC)
+    .run();
+  return ok({ id, expiresIn: SMS_TTL_SEC, retryAfter: SMS_SEND_GAP_SEC });
+}
+
+async function loginSms(env: Env, request: Request) {
+  const user = await requireUser(env, request);
+  if (user instanceof Response) return user;
+  const body = await readJson<{ id?: string; captcha?: string }>(request);
+  const id = (body.id || "").trim();
+  if (!id) return err("请先发送验证码");
+  const row = await env.DB.prepare("SELECT * FROM sms_sessions WHERE id = ? AND user_id = ?")
+    .bind(id, user.id)
+    .first<{
+      id: string;
+      phone: string;
+      countrycode: string;
+      cookie: string;
+      expires_at: number;
+    }>();
+  if (!row) return err("验证码已失效，请重新发送");
+  if (nowSec() > row.expires_at) {
+    await env.DB.prepare("DELETE FROM sms_sessions WHERE id = ?").bind(id).run();
+    return err("验证码已过期，请重新发送");
+  }
+  try {
+    const login = await loginBySms(
+      { cookie: row.cookie, phone: row.phone, countrycode: row.countrycode },
+      body.captcha || "",
+    );
+    const profile = await resolveNeteaseProfile(login.cookie, login.profile);
+    await upsertNeteaseAccount(env, user.id, login.cookie, profile);
+    await env.DB.prepare("DELETE FROM sms_sessions WHERE id = ?").bind(id).run();
+    return ok({ message: "绑定成功", profile });
+  } catch (e) {
+    if (e instanceof CookieExpiredError) return err("登录失败，请重新发送验证码");
+    return err(e instanceof Error ? e.message : "登录失败");
   }
 }
 
@@ -517,6 +635,19 @@ async function manualListen(env: Env, request: Request) {
   const admin = await requireAdmin(env, request);
   if (admin instanceof Response) return admin;
   const result = await kickListen(env);
+  return ok(result);
+}
+
+async function listDbMigrations(env: Env, request: Request) {
+  const admin = await requireAdmin(env, request);
+  if (admin instanceof Response) return admin;
+  return ok(await listMigrations(env.DB));
+}
+
+async function runDbMigrations(env: Env, request: Request) {
+  const admin = await requireAdmin(env, request);
+  if (admin instanceof Response) return admin;
+  const result = await applyPendingMigrations(env.DB);
   return ok(result);
 }
 

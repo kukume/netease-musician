@@ -111,7 +111,7 @@ function cronStatusText(cron) {
 
 function listenState(a) {
   const now = Math.floor(Date.now() / 1000);
-  if (a.status === "expired") return "Cookie 已失效，请重新扫码";
+  if (a.status === "expired") return "Cookie 已失效，请重新登录";
   if (a.pendingSongId && a.reportAt > now) {
     return `正在听「${a.pendingSongName || a.pendingSongId}」，约 ${fmtRemain(a.reportAt - now)} 后上报`;
   }
@@ -293,7 +293,7 @@ function renderHome(playlist, current, o) {
     <div class="grid">
       <div class="card">
         <h2>${playlist.name ? escapeHtml(playlist.name) : "等待管理员设置歌单"}</h2>
-        <div class="muted">${playlist.listenEnabled === false ? "互助听歌已暂停" : "每 2 分钟扫描到期账号：各自随机开听，听完一首才排下一首。"}</div>
+        <div class="muted">${playlist.listenEnabled === false ? "互助听歌已暂停" : "每 2 分钟扫描到期账号：各自随机开听，跳过自己的歌，听完一首才排下一首。"}</div>
         <div class="muted" data-cron-status>${escapeHtml(cronStatusText(o.cron))}</div>
         <div class="nowplay">
           ${coverTag(current.cover || playlist.cover)}
@@ -326,7 +326,7 @@ function renderHome(playlist, current, o) {
       <div>
         <div class="card">
           <h2>网易云账号</h2>
-          <div class="muted">每个账号独立听歌，同一时间只会听一首。登录失效后需重新扫码。</div>
+          <div class="muted">每个账号独立听歌，同一时间只会听一首。登录失效后可扫码、手机验证码或粘贴 Cookie 重新登录。</div>
           ${(accounts || [])
             .map(
               (a) => `
@@ -341,7 +341,7 @@ function renderHome(playlist, current, o) {
             </div>`,
             )
             .join("") || `<div class="muted" style="margin-top:12px">还没有绑定账号</div>`}
-          <button class="btn" id="bind">${accounts.some((a) => a.status === "expired") ? "重新扫码登录" : accounts.length ? "继续绑定账号" : "扫码绑定网易云"}</button>
+          <button class="btn" id="bind">${accounts.some((a) => a.status === "expired") ? "重新登录" : accounts.length ? "继续绑定账号" : "绑定网易云"}</button>
         </div>
         <div class="card" style="margin-top:18px">
           <h2>我的听歌记录</h2>
@@ -378,6 +378,11 @@ function renderAdmin() {
         ${p.playlist_id ? `<button class="btn ghost small" id="refresh-playlist" type="button">重新拉取歌单</button>` : ""}
         <button class="btn ghost small" id="toggle-listen" type="button">${p.listen_enabled ? "暂停听歌" : "开启听歌"}</button>
         <button class="btn ghost small" id="run-now" type="button">立即调度空闲账号</button>
+        <button class="btn ghost small" id="run-migrate" type="button">${
+          (state.admin.migrate?.pending || []).length
+            ? `应用数据库迁移（${state.admin.migrate.pending.length}）`
+            : "应用数据库迁移"
+        }</button>
       </form>
       <div class="nowplay">
         ${coverTag(p.cover)}
@@ -641,6 +646,24 @@ function bindAdmin() {
       btn.textContent = prev;
     }
   };
+  const migrateBtn = $("#run-migrate");
+  if (migrateBtn) {
+    migrateBtn.onclick = async () => {
+      const prev = migrateBtn.textContent;
+      migrateBtn.disabled = true;
+      migrateBtn.textContent = "正在迁移…";
+      try {
+        const data = await api("/api/admin/migrate", { method: "POST" });
+        const ran = data.ran || [];
+        toast(ran.length ? `已应用：${ran.join("、")}` : "没有待应用的迁移");
+        await loadAdmin();
+      } catch (e) {
+        toast(e.message, "error");
+        migrateBtn.disabled = false;
+        migrateBtn.textContent = prev;
+      }
+    };
+  }
   $("#new-invite").onclick = async () => {
     try {
       const data = await api("/api/admin/invites", { method: "POST", body: { count: 1 } });
@@ -737,24 +760,165 @@ function openPasswordModal() {
   };
 }
 
+function showBindTab(wrap, name) {
+  wrap.querySelectorAll("[data-bind-tab]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.bindTab === name);
+  });
+  wrap.querySelectorAll("[data-bind-panel]").forEach((el) => {
+    el.hidden = el.dataset.bindPanel !== name;
+  });
+}
+
 function openQrModal() {
   const wrap = document.createElement("div");
   wrap.className = "modal-bg";
+  wrap.dataset.smsId = "";
   wrap.innerHTML = `
     <div class="modal">
-      <h2>扫码绑定网易云</h2>
-      <div class="muted" id="qr-status">正在生成二维码…</div>
-      <div class="qr-box" id="qr-box"></div>
-      <div class="qr-url" id="qr-url"></div>
+      <h2>绑定网易云</h2>
+      <div class="tabs">
+        <button type="button" class="tab active" data-bind-tab="qr">扫码</button>
+        <button type="button" class="tab" data-bind-tab="sms">手机验证码</button>
+        <button type="button" class="tab" data-bind-tab="cookie">Cookie</button>
+      </div>
+      <div data-bind-panel="qr">
+        <div class="muted" id="qr-status">正在生成二维码…</div>
+        <div id="qr-section">
+          <div class="qr-box" id="qr-box"></div>
+          <div class="qr-url" id="qr-url"></div>
+        </div>
+      </div>
+      <div data-bind-panel="sms" hidden>
+        <label for="sms-phone">手机号</label>
+        <div class="sms-row">
+          <input id="sms-phone" inputmode="tel" autocomplete="tel" placeholder="11 位手机号">
+          <button type="button" class="btn small ghost" id="sms-send">发送验证码</button>
+        </div>
+        <label for="sms-code">验证码</label>
+        <input id="sms-code" inputmode="numeric" autocomplete="one-time-code" placeholder="短信验证码">
+        <button type="button" class="btn" id="sms-login">登录并绑定</button>
+      </div>
+      <div data-bind-panel="cookie" hidden>
+        <label for="cookie-input">从浏览器复制登录后的 Cookie（需含 MUSIC_U 和 __csrf）</label>
+        <textarea id="cookie-input" rows="4" placeholder="MUSIC_U=...; __csrf=..."></textarea>
+        <button class="btn" id="bind-cookie">用 Cookie 绑定</button>
+      </div>
       <button class="btn ghost" id="close-qr">关闭</button>
     </div>
   `;
   document.body.appendChild(wrap);
+  wrap.querySelectorAll("[data-bind-tab]").forEach((btn) => {
+    btn.onclick = () => showBindTab(wrap, btn.dataset.bindTab);
+  });
   $("#close-qr", wrap).onclick = () => {
     clearInterval(state.pollTimer);
     wrap.remove();
   };
+  $("#bind-cookie", wrap).onclick = () => bindWithCookie(wrap);
+  $("#sms-send", wrap).onclick = () => sendSmsCodeUi(wrap);
+  $("#sms-login", wrap).onclick = () => bindWithSms(wrap);
+  $("#sms-phone", wrap).onkeydown = (e) => {
+    if (e.key === "Enter") sendSmsCodeUi(wrap);
+  };
+  $("#sms-code", wrap).onkeydown = (e) => {
+    if (e.key === "Enter") bindWithSms(wrap);
+  };
   startQr(wrap);
+}
+
+async function bindWithCookie(wrap) {
+  const btn = $("#bind-cookie", wrap);
+  const cookie = ($("#cookie-input", wrap).value || "").trim();
+  if (!cookie) {
+    toast("请粘贴 Cookie", "error");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    await api("/api/netease/cookie", { method: "POST", body: { cookie } });
+    clearInterval(state.pollTimer);
+    toast("绑定成功");
+    wrap.remove();
+    await loadHome();
+  } catch (err) {
+    toast(err.message, "error");
+    btn.disabled = false;
+  }
+}
+
+function startSmsCountdown(wrap, seconds) {
+  const btn = $("#sms-send", wrap);
+  let left = seconds;
+  btn.disabled = true;
+  btn.textContent = `${left}s`;
+  const timer = setInterval(() => {
+    left -= 1;
+    if (!wrap.isConnected || left <= 0) {
+      clearInterval(timer);
+      btn.disabled = false;
+      btn.textContent = "发送验证码";
+      return;
+    }
+    btn.textContent = `${left}s`;
+  }, 1000);
+}
+
+async function sendSmsCodeUi(wrap) {
+  const phone = ($("#sms-phone", wrap).value || "").trim();
+  if (!phone) {
+    toast("请输入手机号", "error");
+    return;
+  }
+  const btn = $("#sms-send", wrap);
+  btn.disabled = true;
+  try {
+    const data = await api("/api/netease/sms/send", { method: "POST", body: { phone } });
+    wrap.dataset.smsId = data.id || "";
+    toast("验证码已发送");
+    startSmsCountdown(wrap, data.retryAfter || 60);
+    $("#sms-code", wrap).focus();
+  } catch (err) {
+    toast(err.message, "error");
+    btn.disabled = false;
+    btn.textContent = "发送验证码";
+  }
+}
+
+async function bindWithSms(wrap) {
+  const btn = $("#sms-login", wrap);
+  const captcha = ($("#sms-code", wrap).value || "").trim();
+  const id = wrap.dataset.smsId || "";
+  if (!id) {
+    toast("请先发送验证码", "error");
+    return;
+  }
+  if (!captcha) {
+    toast("请输入验证码", "error");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    await api("/api/netease/sms/login", { method: "POST", body: { id, captcha } });
+    clearInterval(state.pollTimer);
+    toast("绑定成功");
+    wrap.remove();
+    await loadHome();
+  } catch (err) {
+    toast(err.message, "error");
+    btn.disabled = false;
+  }
+}
+
+function stopQrScan(wrap, message) {
+  clearInterval(state.pollTimer);
+  state.pollTimer = null;
+  const status = $("#qr-status", wrap);
+  if (status) status.textContent = `${message}。请改用手机验证码或 Cookie`;
+  const active = wrap.querySelector("[data-bind-tab].active");
+  if (!active || active.dataset.bindTab === "qr") showBindTab(wrap, "sms");
+  const phone = $("#sms-phone", wrap);
+  if (phone) phone.focus();
+  toast(message, "error");
 }
 
 async function startQr(wrap) {
@@ -765,27 +929,34 @@ async function startQr(wrap) {
     if (data.qrSvg) box.innerHTML = data.qrSvg;
     $("#qr-url", wrap).textContent = data.url || "";
     $("#qr-status", wrap).textContent = "请用网易云 App 扫码并确认登录";
+    let checking = false;
     state.pollTimer = setInterval(async () => {
+      if (checking || !wrap.isConnected) return;
+      checking = true;
       try {
         const st = await api(`/api/netease/qrcode/${data.id}`);
-        $("#qr-status", wrap).textContent = st.message || st.status;
+        if (!wrap.isConnected) return;
         if (st.status === "ok") {
           clearInterval(state.pollTimer);
+          state.pollTimer = null;
           toast("绑定成功");
           wrap.remove();
           await loadHome();
+          return;
         }
-        if (st.status === "expired") {
-          clearInterval(state.pollTimer);
-          $("#qr-status", wrap).textContent = "二维码已过期，请关闭后重试";
+        if (st.status === "expired" || st.status === "error" || st.status === "verify") {
+          stopQrScan(wrap, st.message || "扫码失败");
+          return;
         }
+        $("#qr-status", wrap).textContent = st.message || st.status;
       } catch (e) {
-        clearInterval(state.pollTimer);
-        toast(e.message, "error");
+        if (wrap.isConnected) stopQrScan(wrap, e.message);
+      } finally {
+        checking = false;
       }
     }, 1500);
   } catch (e) {
-    $("#qr-status", wrap).textContent = e.message;
+    stopQrScan(wrap, e.message);
   }
 }
 
@@ -798,11 +969,12 @@ async function loadHome() {
 
 async function loadAdmin() {
   state.view = "admin";
-  const [users, invites, playlist, logs] = await Promise.all([
+  const [users, invites, playlist, logs, migrate] = await Promise.all([
     api(`/api/admin/users?page=${state.admin.usersPage || 1}&pageSize=15`),
     api(`/api/admin/invites?page=${state.admin.invitesPage || 1}&pageSize=15`),
     api(`/api/admin/playlist?page=${state.admin.tracksPage || 1}&pageSize=15`),
     api(`/api/admin/logs?page=${state.admin.logsPage || 1}&pageSize=15`),
+    api("/api/admin/migrate"),
   ]);
   state.admin = {
     ...state.admin,
@@ -820,6 +992,7 @@ async function loadAdmin() {
     logsTotalPages: logs.totalPages || 1,
     playlist: playlist.playlist,
     cron: playlist.cron,
+    migrate: { applied: migrate.applied || [], pending: migrate.pending || [] },
     tracks: playlist.tracks || [],
     tracksPage: playlist.page || 1,
     tracksTotal: playlist.total || 0,

@@ -49,6 +49,21 @@ function who(account: { id: string; nickname?: string | null }) {
   return `account="${account.nickname || "未命名"}" id=${account.id.slice(0, 8)}`;
 }
 
+function parseArtistIds(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map((id) => String(id)).filter(Boolean);
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return Array.isArray(value) ? value.map((id) => String(id)).filter(Boolean) : [];
+  } catch {
+    return raw.split(",").map((id) => id.trim()).filter(Boolean);
+  }
+}
+
+function isOwnTrack(artistIds: string[], uid: string): boolean {
+  return !!uid && artistIds.includes(uid);
+}
+
 function overBudget(deadline: number): boolean {
   return Date.now() >= deadline;
 }
@@ -205,8 +220,8 @@ export async function savePlaylist(env: Env, input: string): Promise<{ name: str
   for (let i = 0; i < info.tracks.length; i += 40) {
     const chunk = info.tracks.slice(i, i + 40).map((t, offset) =>
       env.DB.prepare(
-        "INSERT INTO playlist_tracks (idx, song_id, name, artist, album, duration, cover) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      ).bind(i + offset, t.songId, t.name, t.artist, t.album, t.duration, t.cover),
+        "INSERT INTO playlist_tracks (idx, song_id, name, artist, album, duration, cover, artist_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(i + offset, t.songId, t.name, t.artist, t.album, t.duration, t.cover, JSON.stringify(t.artistIds || [])),
     );
     await env.DB.batch(chunk);
   }
@@ -457,9 +472,11 @@ async function startOneAccount(
   let idx = Number(account.listen_cursor || 0) % n;
 
   let cookie: string;
+  let uid = "";
   try {
     cookie = await decryptText(env.SESSION_SECRET, account.cookie_enc);
     const me = await assertCookieValid(cookie);
+    uid = me.uid;
     listenLog("cookie.ok", `${who(account)} uid=${me.uid} nickname="${me.nickname}"`);
   } catch (e) {
     const expired = e instanceof CookieExpiredError;
@@ -469,7 +486,10 @@ async function startOneAccount(
     return { started: 0, fail: 1 };
   }
 
-  for (let attempt = 0; attempt < MAX_SONG_TRIES; attempt += 1) {
+  let playFails = 0;
+  let scanned = 0;
+  let ownSkipped = 0;
+  while (scanned < n && playFails < MAX_SONG_TRIES) {
     if (overBudget(deadline)) {
       await env.DB.prepare(
         `UPDATE netease_accounts SET listening_until = 0, listen_cursor = ?, next_listen_at = ? WHERE id = ?`,
@@ -480,20 +500,31 @@ async function startOneAccount(
       return { started: 0, fail: 0 };
     }
 
+    scanned += 1;
     const nextCursor = (idx + 1) % n;
     const track = await env.DB.prepare(
-      "SELECT song_id as songId, name, artist, album, duration, cover FROM playlist_tracks WHERE idx = ?",
+      "SELECT song_id as songId, name, artist, album, duration, cover, artist_ids as artistIds FROM playlist_tracks WHERE idx = ?",
     )
       .bind(idx)
-      .first<PlaylistTrack>();
+      .first<PlaylistTrack & { artistIds?: string | string[] }>();
     if (!track) {
       listenLog("start.fail", `${who(account)} idx=${idx} 歌单没有对应歌曲，跳到下一首 next=${nextCursor}`);
+      await env.DB.prepare("UPDATE netease_accounts SET listen_cursor = ? WHERE id = ?").bind(nextCursor, account.id).run();
+      idx = nextCursor;
+      playFails += 1;
+      continue;
+    }
+
+    const artistIds = parseArtistIds(track.artistIds);
+    if (isOwnTrack(artistIds, uid)) {
+      ownSkipped += 1;
+      listenLog("start.skip-own", `${who(account)} idx=${idx} song=${track.songId} ${track.name} 是自己的歌，跳过 next=${nextCursor}`);
       await env.DB.prepare("UPDATE netease_accounts SET listen_cursor = ? WHERE id = ?").bind(nextCursor, account.id).run();
       idx = nextCursor;
       continue;
     }
 
-    listenLog("start.begin", `${who(account)} idx=${idx} try=${attempt + 1}/${MAX_SONG_TRIES} song=${track.songId} ${track.name} / ${track.artist}`);
+    listenLog("start.begin", `${who(account)} idx=${idx} try=${playFails + 1}/${MAX_SONG_TRIES} song=${track.songId} ${track.name} / ${track.artist}`);
     try {
       const { durationS } = await startPlaySession(cookie, track.songId, {
         fallbackDurationMs: track.duration,
@@ -506,6 +537,7 @@ async function startOneAccount(
           .bind(nextCursor, message.slice(0, 500), account.id)
           .run();
         idx = nextCursor;
+        playFails += 1;
         continue;
       }
 
@@ -556,10 +588,12 @@ async function startOneAccount(
         .bind(nextCursor, message.slice(0, 500), account.id)
         .run();
       idx = nextCursor;
+      playFails += 1;
     }
   }
 
-  await markAccountError(env, account.id, false, "连续几首无法开听，稍后再试", nowSec() + nextGapSec(), idx);
+  const message = ownSkipped >= n ? "歌单里没有可听的他人歌曲" : "连续几首无法开听，稍后再试";
+  await markAccountError(env, account.id, false, message, nowSec() + nextGapSec(), idx);
   return { started: 0, fail: 1 };
 }
 

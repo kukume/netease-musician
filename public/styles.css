@@ -329,11 +329,46 @@ cap-widget {
   display: grid; place-items: center; z-index: 20; padding: 16px;
 }
 .modal {
-  width: min(420px, 100%);
+  width: min(460px, 100%);
+  max-height: 90vh;
+  overflow: auto;
   background: var(--panel-strong);
   border: 1px solid var(--line);
   border-radius: 24px;
   padding: 22px;
+}
+.or-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.or-line::before,
+.or-line::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.modal .tabs { margin-bottom: 12px; flex-wrap: wrap; }
+.sms-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.sms-row input { flex: 1; }
+.sms-row .btn {
+  width: auto;
+  margin-top: 0;
+  flex-shrink: 0;
+}
+.modal textarea {
+  min-height: 88px;
+  font-size: 12px;
+  line-height: 1.45;
+  resize: vertical;
 }
 .logs { max-height: 360px; overflow: auto; }
 .logline { font-size: 13px; color: var(--muted); padding: 8px 0; border-bottom: 1px solid var(--line); }

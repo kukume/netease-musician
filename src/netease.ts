@@ -20,8 +20,18 @@ export class QrWaitError extends Error {
   }
 }
 
+export class QrBlockedError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "verify" | "fail" = "fail",
+  ) {
+    super(message);
+    this.name = "QrBlockedError";
+  }
+}
+
 export class CookieExpiredError extends Error {
-  constructor(message = "网易云登录已失效，请重新扫码") {
+  constructor(message = "网易云登录已失效，请重新扫码或粘贴 Cookie") {
     super(message);
     this.name = "CookieExpiredError";
   }
@@ -45,6 +55,7 @@ export type PlaylistTrack = {
   album: string;
   duration: number;
   cover: string;
+  artistIds?: string[];
 };
 
 export type PlaylistInfo = {
@@ -89,6 +100,25 @@ export function mergeCookie(...parts: string[]): string {
     }
   }
   return [...seen.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+export function parseNeteaseCookie(raw: string): string {
+  let text = (raw || "").trim();
+  if (!text) throw new Error("请粘贴网易云 Cookie");
+  if (text.toLowerCase().startsWith("cookie:")) text = text.slice(7).trim();
+  if (text.startsWith("{")) {
+    try {
+      const obj = JSON.parse(text) as Record<string, unknown>;
+      text = String(obj.cookie || obj.Cookie || obj.value || "");
+    } catch {
+      throw new Error("Cookie 格式无法识别");
+    }
+  }
+  text = text.replace(/\r/g, "").replace(/\n+/g, "; ");
+  const cookie = mergeCookie(text);
+  if (!cookie.includes("MUSIC_U=")) throw new Error("Cookie 里没有 MUSIC_U，请复制登录后的完整 Cookie");
+  if (!cookie.includes("__csrf=")) throw new Error("Cookie 里没有 __csrf，请复制完整 Cookie");
+  return cookie;
 }
 
 function renderSetCookie(res: Response): string {
@@ -256,6 +286,29 @@ export async function getQrcode(): Promise<QrSession> {
   return { unikey, url, chainId: cid, cookie };
 }
 
+function qrBlocked(json: Record<string, unknown>, code: number): QrBlockedError | null {
+  const data = (json.data as Record<string, unknown> | undefined) || {};
+  const msg = String(json.message || json.msg || data.blockText || json.blockText || "").trim();
+  const verifyUrl = String(json.verifyUrl || data.verifyUrl || "");
+  const verifyType = json.verifyType ?? data.verifyType;
+  const isVerify =
+    code === 250 ||
+    code === 406 ||
+    code === 415 ||
+    code === 8821 ||
+    code === -462 ||
+    Boolean(verifyUrl) ||
+    verifyType != null ||
+    /需要验证|安全验证|图形验证|滑块|云盾|安全风险|切换其他登录/.test(msg);
+  if (isVerify) {
+    return new QrBlockedError(msg || "网易云需要安全验证，扫码无法完成", "verify");
+  }
+  if (code !== 803) {
+    return new QrBlockedError(msg || `网易云登录失败，错误代码 ${code}`, "fail");
+  }
+  return null;
+}
+
 export async function checkQrcode(session: QrSession): Promise<{ cookie: string; profile?: Record<string, unknown> }> {
   const { json, cookie, response } = await weapiPost(
     "/weapi/login/qrcode/client/login",
@@ -267,8 +320,88 @@ export async function checkQrcode(session: QrSession): Promise<{ cookie: string;
   if (code === 801) throw new QrWaitError("等待扫码", 801);
   if (code === 802) throw new QrWaitError("已扫码，等待确认", 802);
   if (code === 800) throw new QrWaitError("网易云二维码已过期", 800);
+  const blocked = qrBlocked(json, code);
+  if (blocked) throw blocked;
+  const merged = mergeCookie(session.cookie, cookie, renderSetCookie(response));
+  if (!merged.includes("MUSIC_U=")) throw new QrBlockedError("未获取到网易云登录 cookie", "fail");
+  return { cookie: merged, profile: json };
+}
+
+export type SmsSession = {
+  cookie: string;
+  phone: string;
+  countrycode: string;
+};
+
+export function normalizePhone(raw: string, countrycode = "86"): { phone: string; countrycode: string } {
+  let phone = (raw || "").trim().replace(/[\s-]/g, "");
+  let cc = String(countrycode || "86").replace(/\D/g, "") || "86";
+  if (phone.startsWith("+")) {
+    const m = phone.match(/^\+(\d{1,4})(\d{6,15})$/);
+    if (!m) throw new Error("请输入正确的手机号");
+    cc = m[1];
+    phone = m[2];
+  } else if (cc === "86" && phone.startsWith("86") && phone.length === 13) {
+    phone = phone.slice(2);
+  }
+  if (cc === "86") {
+    if (!/^1\d{10}$/.test(phone)) throw new Error("请输入正确的手机号");
+  } else if (!/^\d{6,15}$/.test(phone)) {
+    throw new Error("请输入正确的手机号");
+  }
+  return { phone, countrycode: cc };
+}
+
+function assertCellphoneLogin(json: Record<string, unknown>) {
+  const code = Number(json.code ?? -1);
+  const data = (json.data as Record<string, unknown> | undefined) || {};
+  const blocked = qrBlocked(json, code === 803 ? 803 : code);
+  if (blocked?.kind === "verify") throw blocked;
+  if (code === 200 || code === 803 || json.profile || data.userId) return;
+  const msg = String(json.message || json.msg || data.blockText || "").trim();
+  throw new Error(msg || `网易云登录失败，错误代码 ${code}`);
+}
+
+export async function sendSmsCode(phone: string, countrycode = "86"): Promise<SmsSession> {
+  const parsed = normalizePhone(phone, countrycode);
+  const cookie0 = await bootstrap();
+  const { json, cookie } = await weapiPost(
+    "/weapi/sms/captcha/sent",
+    {
+      cellphone: parsed.phone,
+      ctcode: parsed.countrycode,
+      secrete: "music_user_login",
+      noCheckToken: true,
+    },
+    cookie0,
+  );
+  const code = Number(json.code ?? -1);
+  if (code === -12) throw new Error("网易云要求图形验证码，请改用扫码或 Cookie 登录");
   if (code === 8821) throw new Error(String(json.message || "请切换其他登录方式或升级新版本再试"));
-  if (code !== 803) throw new Error(String(json.message || `网易云登录失败，错误代码 ${code}`));
+  if (code !== 200) throw new Error(String(json.message || `网易云发送验证码失败，错误代码 ${code}`));
+  return { cookie, phone: parsed.phone, countrycode: parsed.countrycode };
+}
+
+export async function loginBySms(
+  session: SmsSession,
+  captcha: string,
+): Promise<{ cookie: string; profile?: Record<string, unknown> }> {
+  const code = (captcha || "").trim();
+  if (!code) throw new Error("请输入验证码");
+  const { json, cookie, response } = await weapiPost(
+    "/weapi/login/cellphone",
+    {
+      countrycode: session.countrycode,
+      phone: session.phone,
+      captcha: code,
+      rememberLogin: "true",
+      noCheckToken: true,
+      ydDeviceToken: "",
+    },
+    session.cookie,
+    { loginMethod: "Cellphone" },
+  );
+  assertCellphoneLogin(json);
   const merged = mergeCookie(session.cookie, cookie, renderSetCookie(response));
   if (!merged.includes("MUSIC_U=")) throw new Error("未获取到网易云登录 cookie");
   return { cookie: merged, profile: json };
@@ -307,7 +440,10 @@ export function parsePlaylistId(input: string): string {
 function mapTrack(raw: Record<string, unknown>): PlaylistTrack | null {
   const id = raw.id;
   if (id == null) return null;
-  const artists = (raw.ar as Array<{ name?: string }> | undefined) || (raw.artists as Array<{ name?: string }> | undefined) || [];
+  const artists =
+    (raw.ar as Array<{ id?: unknown; name?: string }> | undefined) ||
+    (raw.artists as Array<{ id?: unknown; name?: string }> | undefined) ||
+    [];
   const album = (raw.al as Record<string, unknown> | undefined) || (raw.album as Record<string, unknown> | undefined) || {};
   return {
     songId: String(id),
@@ -316,6 +452,7 @@ function mapTrack(raw: Record<string, unknown>): PlaylistTrack | null {
     album: String(album.name || ""),
     duration: Number(raw.dt || raw.duration || 0),
     cover: String(album.picUrl || ""),
+    artistIds: artists.map((a) => (a.id == null ? "" : String(a.id))).filter(Boolean),
   };
 }
 
