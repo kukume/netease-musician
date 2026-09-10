@@ -101,7 +101,7 @@ function cronStatusText(cron) {
   const when = age < 5 ? "刚刚" : `${fmtRemain(age)}前`;
   if (cron.status === "error") return `定时任务 ${when}出错${cron.message ? `：${cron.message}` : ""}`;
   if (!cron.healthy) return `定时任务已 ${fmtRemain(age)} 未正常触发，请检查 Cloudflare Cron`;
-  if (cron.status === "busy") return `定时任务 ${when}上一轮开听未结束，本分钟只做了上报`;
+  if (cron.status === "busy") return `定时任务 ${when}上一轮开听未结束，本轮只做了上报`;
   const extra =
     cron.leftoverStarts || cron.leftoverReports
       ? `，剩余 ${cron.leftoverStarts || 0} 开听 / ${cron.leftoverReports || 0} 上报留给下轮`
@@ -293,7 +293,7 @@ function renderHome(playlist, current, o) {
     <div class="grid">
       <div class="card">
         <h2>${playlist.name ? escapeHtml(playlist.name) : "等待管理员设置歌单"}</h2>
-        <div class="muted">${playlist.listenEnabled === false ? "互助听歌已暂停" : "每分钟扫描到期账号：各自随机开听，听完一首才排下一首。"}</div>
+        <div class="muted">${playlist.listenEnabled === false ? "互助听歌已暂停" : "每 2 分钟扫描到期账号：各自随机开听，听完一首才排下一首。"}</div>
         <div class="muted" data-cron-status>${escapeHtml(cronStatusText(o.cron))}</div>
         <div class="nowplay">
           ${coverTag(current.cover || playlist.cover)}

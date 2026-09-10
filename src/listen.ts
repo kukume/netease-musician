@@ -17,7 +17,7 @@ const MAX_SONG_TRIES = 3;
 const CONCURRENCY = 3;
 const TICK_BUDGET_MS = 45_000;
 const REPORT_STALE_SEC = 10 * 60;
-const CRON_HEALTHY_SEC = 180;
+const CRON_HEALTHY_SEC = 300;
 const GAP_MIN_SEC = 40;
 const GAP_MAX_SEC = 180;
 const SCATTER_MAX_SEC = 240;
@@ -132,7 +132,7 @@ async function acquireWorkOrSkip(env: Env, owner: string, phase: string): Promis
     return true;
   }
   const lock = await readWorkLock(env);
-  listenLog("work.skip", `busy=${lock.phase || "unknown"} 上一次开听还在跑，本分钟只上报`);
+  listenLog("work.skip", `busy=${lock.phase || "unknown"} 上一次开听还在跑，本轮只上报`);
   return false;
 }
 
@@ -476,7 +476,7 @@ async function startOneAccount(
       )
         .bind(idx, nowSec(), account.id)
         .run();
-      listenLog("start.defer", `${who(account)} 本轮超时，游标=${idx} 留给下一分钟`);
+      listenLog("start.defer", `${who(account)} 本轮超时，游标=${idx} 留给下一轮`);
       return { started: 0, fail: 0 };
     }
 
