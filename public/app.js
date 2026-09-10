@@ -95,6 +95,20 @@ function fmtRemain(sec) {
   return `${m} 分 ${r} 秒`;
 }
 
+function cronStatusText(cron) {
+  if (!cron || !cron.at) return "定时任务尚未运行";
+  const age = typeof cron.ageSec === "number" ? cron.ageSec : Math.max(0, Math.floor(Date.now() / 1000) - cron.at);
+  const when = age < 5 ? "刚刚" : `${fmtRemain(age)}前`;
+  if (cron.status === "error") return `定时任务 ${when}出错${cron.message ? `：${cron.message}` : ""}`;
+  if (!cron.healthy) return `定时任务已 ${fmtRemain(age)} 未正常触发，请检查 Cloudflare Cron`;
+  if (cron.status === "busy") return `定时任务 ${when}上一轮开听未结束，本分钟只做了上报`;
+  const extra =
+    cron.leftoverStarts || cron.leftoverReports
+      ? `，剩余 ${cron.leftoverStarts || 0} 开听 / ${cron.leftoverReports || 0} 上报留给下轮`
+      : "";
+  return `定时任务 ${when}正常 · 开听 ${cron.started || 0} / 上报 ${cron.reported || 0} · ${cron.wallMs || 0}ms${extra}`;
+}
+
 function listenState(a) {
   const now = Math.floor(Date.now() / 1000);
   if (a.status === "expired") return "Cookie 已失效，请重新扫码";
@@ -280,6 +294,7 @@ function renderHome(playlist, current, o) {
       <div class="card">
         <h2>${playlist.name ? escapeHtml(playlist.name) : "等待管理员设置歌单"}</h2>
         <div class="muted">${playlist.listenEnabled === false ? "互助听歌已暂停" : "每分钟扫描到期账号：各自随机开听，听完一首才排下一首。"}</div>
+        <div class="muted" data-cron-status>${escapeHtml(cronStatusText(o.cron))}</div>
         <div class="nowplay">
           ${coverTag(current.cover || playlist.cover)}
           <div>
@@ -356,6 +371,7 @@ function renderAdmin() {
     <div class="card" style="margin-bottom:18px">
       <h2>互助歌单</h2>
       <div class="muted">粘贴网易云歌单链接或 ID。保存后每个绑定账号会按自己的进度、在随机时间听这个歌单。</div>
+      <div class="muted" data-cron-status>${escapeHtml(cronStatusText(state.admin.cron))}</div>
       <form id="playlist-form" style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
         <input name="playlist" placeholder="https://music.163.com/playlist?id=..." style="flex:1;min-width:240px" />
         <button class="btn small" type="submit">拉取并保存</button>
@@ -803,6 +819,7 @@ async function loadAdmin() {
     logsTotal: logs.total || 0,
     logsTotalPages: logs.totalPages || 1,
     playlist: playlist.playlist,
+    cron: playlist.cron,
     tracks: playlist.tracks || [],
     tracksPage: playlist.page || 1,
     tracksTotal: playlist.total || 0,

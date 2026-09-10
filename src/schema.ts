@@ -94,7 +94,8 @@ const STATEMENTS = [
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`,
-  `INSERT OR IGNORE INTO site_settings (key, value) VALUES ('listen_work', '{"owner":"","phase":"idle","refs":0,"expiresAt":0}')`,
+  `INSERT OR IGNORE INTO site_settings (key, value) VALUES ('listen_work', '{"owner":"","phase":"idle","expiresAt":0}')`,
+  `INSERT OR IGNORE INTO site_settings (key, value) VALUES ('listen_cron', '{"at":0,"status":"idle","wallMs":0,"started":0,"reported":0,"leftoverStarts":0,"leftoverReports":0}')`,
   `CREATE TABLE IF NOT EXISTS d1_migrations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE,
@@ -115,6 +116,7 @@ const MIGRATION_NAMES = [
   "0003_per_account_listen.sql",
   "0004_site_settings.sql",
   "0005_listen_work.sql",
+  "0006_listen_cron.sql",
 ];
 
 export async function ensureStorageSchema(db: D1Database): Promise<void> {

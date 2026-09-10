@@ -1,6 +1,5 @@
-import { bootstrapAdmin } from "./auth";
 import { handleApi } from "./api";
-import { tickListen } from "./listen";
+import { recordCronError, tickListen } from "./listen";
 import { dbNotReadyResponse, ensureSchema } from "./setup";
 
 export default {
@@ -16,12 +15,24 @@ export default {
   },
 
   async scheduled(_controller, env) {
-    if (!(await ensureSchema(env))) {
-      console.log("[listen] scheduled.skip 数据库未就绪");
-      return;
+    const t0 = Date.now();
+    try {
+      if (!(await ensureSchema(env))) {
+        console.log("[listen] scheduled.skip 数据库未就绪");
+        return;
+      }
+      console.log("[listen] scheduled.begin");
+      await tickListen(env);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.error("[listen] scheduled.fail", message);
+      try {
+        await recordCronError(env, message, Date.now() - t0);
+      } catch (err) {
+        console.error("[listen] heartbeat.fail", err);
+      }
+    } finally {
+      console.log(`[listen] scheduled.end wallMs=${Date.now() - t0}`);
     }
-    await bootstrapAdmin(env);
-    console.log("[listen] scheduled.begin");
-    await tickListen(env);
   },
 } satisfies ExportedHandler<Env>;

@@ -24,7 +24,7 @@ import {
   getQrcode,
   QrWaitError,
 } from "./netease";
-import { getPlaylistMeta, kickListen, listTracks, randomListenAt, savePlaylist } from "./listen";
+import { getCronHeartbeat, getPlaylistMeta, kickListen, listTracks, randomListenAt, savePlaylist } from "./listen";
 import { qrToSvg } from "./qr";
 import { publicCapConfig, verifyCapToken } from "./cap";
 
@@ -204,6 +204,7 @@ async function overview(env: Env, request: Request) {
   )
     .bind(user.id, now)
     .first();
+  const cron = await getCronHeartbeat(env);
   return ok({
     playlist: meta
       ? {
@@ -216,6 +217,7 @@ async function overview(env: Env, request: Request) {
         }
       : null,
     current,
+    cron,
     tracks,
     tracksPage: page,
     tracksPageSize: pageSize,
@@ -474,6 +476,7 @@ async function adminPlaylist(env: Env, request: Request) {
   const tracks = await listTracks(env, pageSize, offset);
   return ok({
     playlist: meta,
+    cron: await getCronHeartbeat(env),
     tracks,
     page,
     pageSize,

@@ -7,6 +7,7 @@ export const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 
 const PLAYER_URL = ORIGIN + "/weapi/song/enhance/player/url/v1";
+const ACCOUNT_GET = "/weapi/w/nuser/account/get";
 const WEBLOG_URL = "https://clientlogusf.music.163.com/weapi/feedback/weblog";
 const DEVICE_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
@@ -274,15 +275,26 @@ export async function checkQrcode(session: QrSession): Promise<{ cookie: string;
 }
 
 export async function fetchAccount(cookie: string): Promise<{ uid: string; nickname: string; avatar: string }> {
-  const { json } = await weapiPost("/weapi/nuser/account/get", {}, cookie);
+  const { json, response } = await weapiPost(ACCOUNT_GET, {}, cookie, { loginSensitive: true });
+  throwIfCookieExpired(response, json);
   const profile = (json.profile as Record<string, unknown> | undefined) || {};
   const account = (json.account as Record<string, unknown> | undefined) || {};
   const uid = String(profile.userId || account.id || "");
+  if (!uid || account.anonimousUser === true) {
+    listenLog("cookie.expired", `profile=${json.profile == null ? "null" : "empty"} anonymous=${account.anonimousUser === true}`);
+    throw new CookieExpiredError();
+  }
   return {
     uid,
     nickname: String(profile.nickname || "网易云用户"),
     avatar: String(profile.avatarUrl || ""),
   };
+}
+
+/** 开听前探活：资料接口有 profile 才算登录有效。失效时常仍是 HTTP 200、profile=null。 */
+export async function assertCookieValid(cookie: string): Promise<{ uid: string; nickname: string }> {
+  const me = await fetchAccount(cookie);
+  return { uid: me.uid, nickname: me.nickname };
 }
 
 export function parsePlaylistId(input: string): string {
