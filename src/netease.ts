@@ -424,6 +424,19 @@ export async function fetchAccount(cookie: string): Promise<{ uid: string; nickn
   };
 }
 
+/** 音乐人资料里的 artistId 才对应歌曲 ar[].id，和登录 userId 不是同一套。 */
+export async function fetchUserArtistId(cookie: string, uid: string): Promise<string> {
+  if (!uid) return "";
+  try {
+    const { json } = await weapiPost(`/weapi/w/v1/user/detail/${encodeURIComponent(uid)}`, {}, cookie);
+    const profile = (json.profile as Record<string, unknown> | undefined) || {};
+    const id = profile.artistId;
+    return id == null || id === "" ? "" : String(id);
+  } catch {
+    return "";
+  }
+}
+
 /** 开听前探活：资料接口有 profile 才算登录有效。失效时常仍是 HTTP 200、profile=null。 */
 export async function assertCookieValid(cookie: string): Promise<{ uid: string; nickname: string }> {
   const me = await fetchAccount(cookie);

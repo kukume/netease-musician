@@ -44,6 +44,7 @@ const STATEMENTS = [
     pending_artist TEXT,
     pending_duration INTEGER NOT NULL DEFAULT 0,
     pending_source_id TEXT,
+    artist_id TEXT,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`,
   `CREATE TABLE IF NOT EXISTS qr_sessions (
@@ -179,6 +180,10 @@ const FILE_MIGRATIONS: { name: string; statements: string[] }[] = [
       )`,
       "CREATE INDEX IF NOT EXISTS idx_sms_sessions_user ON sms_sessions(user_id)",
     ],
+  },
+  {
+    name: "0009_account_artist_id.sql",
+    statements: ["ALTER TABLE netease_accounts ADD COLUMN artist_id TEXT"],
   },
 ];
 

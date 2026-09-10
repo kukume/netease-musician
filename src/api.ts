@@ -22,6 +22,7 @@ import {
   checkQrcode,
   CookieExpiredError,
   fetchAccount,
+  fetchUserArtistId,
   getQrcode,
   loginBySms,
   parseNeteaseCookie,
@@ -53,10 +54,12 @@ async function upsertNeteaseAccount(
   env: Env,
   userId: string,
   cookie: string,
-  profile: { uid: string; nickname: string; avatar: string },
+  profile: { uid: string; nickname: string; avatar: string; artistId?: string },
 ) {
   const cookieEnc = await encryptText(env.SESSION_SECRET, cookie);
   const nextAt = randomListenAt();
+  let artistId = profile.artistId || "";
+  if (!artistId && profile.uid) artistId = await fetchUserArtistId(cookie, profile.uid);
   const existing = profile.uid
     ? await env.DB.prepare("SELECT id FROM netease_accounts WHERE user_id = ? AND netease_uid = ?")
         .bind(userId, profile.uid)
@@ -65,18 +68,18 @@ async function upsertNeteaseAccount(
   if (existing) {
     await env.DB.prepare(
       `UPDATE netease_accounts
-       SET nickname = ?, avatar = ?, cookie_enc = ?, status = 'active', last_error = NULL,
+       SET nickname = ?, avatar = ?, cookie_enc = ?, status = 'active', last_error = NULL, artist_id = CASE WHEN ? != '' THEN ? ELSE artist_id END,
            next_listen_at = CASE WHEN pending_song_id IS NOT NULL THEN next_listen_at ELSE ? END
        WHERE id = ?`,
     )
-      .bind(profile.nickname, profile.avatar, cookieEnc, nextAt, existing.id)
+      .bind(profile.nickname, profile.avatar, cookieEnc, artistId, artistId, nextAt, existing.id)
       .run();
   } else {
     await env.DB.prepare(
-      `INSERT INTO netease_accounts (id, user_id, netease_uid, nickname, avatar, cookie_enc, status, created_at, next_listen_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+      `INSERT INTO netease_accounts (id, user_id, netease_uid, nickname, avatar, cookie_enc, status, created_at, next_listen_at, artist_id)
+       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
     )
-      .bind(newId(), userId, profile.uid || null, profile.nickname, profile.avatar, cookieEnc, nowSec(), nextAt)
+      .bind(newId(), userId, profile.uid || null, profile.nickname, profile.avatar, cookieEnc, nowSec(), nextAt, artistId || null)
       .run();
   }
   return profile;
@@ -468,7 +471,7 @@ async function listAccounts(env: Env, request: Request) {
   const user = await requireUser(env, request);
   if (user instanceof Response) return user;
   const { results } = await env.DB.prepare(
-    `SELECT id, netease_uid as neteaseUid, nickname, avatar, status, last_listen_at as lastListenAt, last_error as lastError, created_at as createdAt,
+    `SELECT id, netease_uid as neteaseUid, artist_id as artistId, nickname, avatar, status, last_listen_at as lastListenAt, last_error as lastError, created_at as createdAt,
             next_listen_at as nextListenAt, report_at as reportAt, pending_song_id as pendingSongId, pending_song_name as pendingSongName
      FROM netease_accounts WHERE user_id = ? ORDER BY created_at DESC`,
   )

@@ -3,6 +3,7 @@ import {
   assertCookieValid,
   CookieExpiredError,
   fetchPublicPlaylist,
+  fetchUserArtistId,
   finishPlaySession,
   MIN_REPORT_SECONDS,
   parsePlaylistId,
@@ -60,8 +61,9 @@ function parseArtistIds(raw: unknown): string[] {
   }
 }
 
-function isOwnTrack(artistIds: string[], uid: string): boolean {
-  return !!uid && artistIds.includes(uid);
+function isOwnTrack(artistIds: string[], ids: string[]): boolean {
+  const mine = new Set(ids.filter(Boolean));
+  return artistIds.some((id) => mine.has(id));
 }
 
 function overBudget(deadline: number): boolean {
@@ -196,6 +198,7 @@ type AccountRow = {
   cookie_enc: string;
   nickname: string | null;
   listen_cursor: number;
+  artist_id?: string | null;
   pending_song_id: string | null;
   pending_song_name: string | null;
   pending_artist: string | null;
@@ -486,6 +489,15 @@ async function startOneAccount(
     return { started: 0, fail: 1 };
   }
 
+  let artistId = String(account.artist_id || "");
+  if (!artistId) {
+    artistId = await fetchUserArtistId(cookie, uid);
+    if (artistId) {
+      await env.DB.prepare("UPDATE netease_accounts SET artist_id = ? WHERE id = ?").bind(artistId, account.id).run();
+      listenLog("artist.ok", `${who(account)} uid=${uid} artistId=${artistId}`);
+    }
+  }
+
   let playFails = 0;
   let scanned = 0;
   let ownSkipped = 0;
@@ -516,7 +528,7 @@ async function startOneAccount(
     }
 
     const artistIds = parseArtistIds(track.artistIds);
-    if (isOwnTrack(artistIds, uid)) {
+    if (isOwnTrack(artistIds, [uid, artistId])) {
       ownSkipped += 1;
       listenLog("start.skip-own", `${who(account)} idx=${idx} song=${track.songId} ${track.name} 是自己的歌，跳过 next=${nextCursor}`);
       await env.DB.prepare("UPDATE netease_accounts SET listen_cursor = ? WHERE id = ?").bind(nextCursor, account.id).run();
@@ -621,7 +633,7 @@ async function startDueAccounts(
   const dueCount = Number(dueRow?.n || 0);
 
   const { results } = await env.DB.prepare(
-    `SELECT id, user_id, cookie_enc, nickname, listen_cursor
+    `SELECT id, user_id, cookie_enc, nickname, listen_cursor, artist_id
      FROM netease_accounts
      WHERE status = 'active' AND pending_song_id IS NULL AND listening_until <= ? AND next_listen_at > 0 AND next_listen_at <= ?
      ORDER BY next_listen_at ASC
