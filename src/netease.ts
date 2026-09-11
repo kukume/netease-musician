@@ -706,12 +706,14 @@ export async function startPlaySession(
     "player.url",
     `id=${info.id || songId} http=${response.status} code=${json.code} br=${info.br} size=${info.size} type=${info.type} level=${info.level} duration=${durationS.toFixed(3)}s playlist=${options?.playlistId || "-"}`,
   );
-  await weblog(
-    cookie,
-    "startplay",
-    { id: String(songId), type: "song", content: playLogContent(songId, source) },
-    "play.startplay",
-  );
+  // 官网切歌时不再发开播 play（无 end），改用 startplay 表示下一首开始。
+  // 每首都按点第一首处理，所以这里不发。
+  // await weblog(
+  //   cookie,
+  //   "startplay",
+  //   { id: String(songId), type: "song", content: playLogContent(songId, source) },
+  //   "play.startplay",
+  // );
   return { durationS, playUrl };
 }
 
