@@ -37,7 +37,7 @@ export default {
   },
 
   async queue(batch, env) {
-    if (!(await ensureSchema(env))) {
+    if (batch.queue !== "netease-musician-audio" && !(await ensureSchema(env))) {
       console.log("[listen] queue.skip 数据库未就绪");
       batch.retryAll({ delaySeconds: 30 });
       return;

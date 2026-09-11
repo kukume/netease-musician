@@ -5,6 +5,7 @@ interface __BaseEnv_Env {
 	DB: D1Database;
 	LISTEN_START: Queue;
 	LISTEN_REPORT: Queue;
+	LISTEN_AUDIO: Queue;
 	ASSETS: Fetcher;
 	ADMIN_USERNAME: string;
 	ADMIN_PASSWORD: string;

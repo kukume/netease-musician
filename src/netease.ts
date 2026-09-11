@@ -62,7 +62,13 @@ export type PlaylistInfo = {
   playlistId: string;
   name: string;
   cover: string;
+  creatorId: string;
   tracks: PlaylistTrack[];
+};
+
+export type PlayLogSource = {
+  playlistId?: string;
+  creatorId?: string;
 };
 
 function randomFrom(chars: string, n: number): string {
@@ -534,13 +540,27 @@ export async function fetchPlaylist(cookie: string, playlistId: string): Promise
   const ordered = trackIds.length
     ? trackIds.map((id) => mapped.find((t) => t.songId === id)).filter((t): t is PlaylistTrack => !!t)
     : mapped;
-  listenLog("playlist.detail", `id=${playlistId} tracks=${ordered.length}`);
+  const creatorId = playlistCreatorId(playlist);
+  listenLog("playlist.detail", `id=${playlistId} tracks=${ordered.length} creator=${creatorId || "-"}`);
   return {
     playlistId: String(playlist.id || playlistId),
     name: String(playlist.name || "未命名歌单"),
     cover: String(playlist.coverImgUrl || ""),
+    creatorId,
     tracks: ordered,
   };
+}
+
+function playlistCreatorId(playlist: Record<string, unknown>): string {
+  const creator = playlist.creator as Record<string, unknown> | undefined;
+  const raw = creator?.userId ?? creator?.id ?? playlist.userId;
+  return raw == null || raw === "" ? "" : String(raw);
+}
+
+export async function fetchPlaylistCreator(cookie: string, playlistId: string): Promise<string> {
+  const { json } = await weapiPost("/weapi/v6/playlist/detail", { id: playlistId, n: 1, s: 1 }, cookie);
+  const playlist = json.playlist as Record<string, unknown> | undefined;
+  return playlist ? playlistCreatorId(playlist) : "";
 }
 
 export async function fetchPublicPlaylist(playlistId: string): Promise<PlaylistInfo> {
@@ -548,7 +568,12 @@ export async function fetchPublicPlaylist(playlistId: string): Promise<PlaylistI
   return fetchPlaylist(cookie, playlistId);
 }
 
-async function weblog(cookie: string, action: string, js: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function weblog(
+  cookie: string,
+  action: string,
+  js: Record<string, unknown>,
+  label?: string,
+): Promise<Record<string, unknown>> {
   const payload = {
     logs: JSON.stringify([
       {
@@ -558,22 +583,116 @@ async function weblog(cookie: string, action: string, js: Record<string, unknown
     ]),
   };
   const { json } = await weapiPost(WEBLOG_URL, payload, cookie, { loginSensitive: true });
-  listenLog(`weblog.${action}`, compactJson(json));
+  listenLog(`weblog.${label || action}`, compactJson(json));
   return json;
+}
+
+/** 官网把 content 写成当前页 query：id=歌单&creatorId=&sharedId= */
+function playLogContent(songId: string, source?: PlayLogSource): string {
+  const playlistId = source?.playlistId;
+  if (playlistId && source?.creatorId) {
+    return `id=${playlistId}&creatorId=${source.creatorId}&sharedId=${source.creatorId}`;
+  }
+  return `id=${playlistId || songId}`;
+}
+
+function playOpenSource(songId: string, playlistId?: string): Record<string, unknown> {
+  if (playlistId) return { source: "list", sourceid: playlistId };
+  return { source: "song", sourceid: songId };
+}
+
+function playEndSource(songId: string, playlistId?: string): Record<string, unknown> {
+  if (playlistId) return { source: "list", sourceId: playlistId };
+  return { source: "song", sourceId: songId };
+}
+
+function toHttps(url: string): string {
+  return url.replace(/^https?:/, "https:");
+}
+
+export async function bumpPlaylistPlaycount(cookie: string, playlistId: string): Promise<void> {
+  const { json, response } = await weapiPost(
+    "/weapi/playlist/update/playcount",
+    { id: playlistId },
+    cookie,
+    { loginSensitive: true },
+  );
+  listenLog("playlist.playcount", `id=${playlistId} http=${response.status} ${compactJson(json)}`);
+}
+
+const AUDIO_PAGE_BYTES = 100 * 1024;
+
+/** 只拉第一页 100KB：Range bytes=0-102399，读满或流结束就停。 */
+export async function fetchPlayAudio(playUrl: string): Promise<{ ok: boolean; status: number; bytes: number }> {
+  const url = toHttps(playUrl);
+  const last = AUDIO_PAGE_BYTES - 1;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": UA,
+      Referer: `${ORIGIN}/`,
+      Accept: "*/*",
+      "Accept-Encoding": "identity;q=1, *;q=0",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      Range: `bytes=0-${last}`,
+    },
+    redirect: "follow",
+    cache: "no-store",
+    signal: AbortSignal.timeout(15_000),
+  });
+  let bytes = 0;
+  const reader = response.body?.getReader();
+  if (reader) {
+    try {
+      while (bytes < AUDIO_PAGE_BYTES) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+  }
+  const ok = response.status === 206 || response.status === 200;
+  listenLog(
+    "audio.get",
+    `http=${response.status} bytes=${bytes} range=${response.headers.get("content-range") || `0-${last}`}`,
+  );
+  return { ok, status: response.status, bytes };
 }
 
 export async function startPlaySession(
   cookie: string,
   songId: string,
-  options?: { level?: string; fallbackDurationMs?: number },
-): Promise<{ durationS: number }> {
+  options?: { level?: string; fallbackDurationMs?: number } & PlayLogSource,
+): Promise<{ durationS: number; playUrl: string }> {
   const level = options?.level || "exhigh";
-  const { json, response } = await weapiPost(
+  const source: PlayLogSource = { playlistId: options?.playlistId, creatorId: options?.creatorId };
+  const urlPromise = weapiPost(
     PLAYER_URL,
     { ids: JSON.stringify([Number(songId)]), level, encodeType: "aac" },
     cookie,
     { loginSensitive: true },
   );
+  await weblog(
+    cookie,
+    "play",
+    {
+      id: String(songId),
+      type: "song",
+      content: playLogContent(songId, source),
+      ...playOpenSource(songId, source.playlistId),
+    },
+    "play.open",
+  );
+  if (source.playlistId) {
+    try {
+      await bumpPlaylistPlaycount(cookie, source.playlistId);
+    } catch (e) {
+      listenLog("playlist.playcount.fail", `${source.playlistId} ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  const { json, response } = await urlPromise;
   throwIfCookieExpired(response, json);
   const list = (json.data as Array<Record<string, unknown>> | undefined) || [];
   const info = list[0];
@@ -582,12 +701,18 @@ export async function startPlaySession(
   const fromPlayer = Number(info.time || 0) / 1000;
   const fallback = Number(options?.fallbackDurationMs || 0) / 1000;
   const durationS = Math.min(MAX_SONG_SECONDS, Math.max(0, fromPlayer || fallback));
+  const playUrl = toHttps(String(info.url));
   listenLog(
     "player.url",
-    `id=${info.id || songId} http=${response.status} code=${json.code} br=${info.br} size=${info.size} type=${info.type} level=${info.level} duration=${durationS.toFixed(3)}s`,
+    `id=${info.id || songId} http=${response.status} code=${json.code} br=${info.br} size=${info.size} type=${info.type} level=${info.level} duration=${durationS.toFixed(3)}s playlist=${options?.playlistId || "-"}`,
   );
-  await weblog(cookie, "startplay", { id: Number(songId), type: "song", content: `id=${songId}` });
-  return { durationS };
+  await weblog(
+    cookie,
+    "startplay",
+    { id: String(songId), type: "song", content: playLogContent(songId, source) },
+    "play.startplay",
+  );
+  return { durationS, playUrl };
 }
 
 export async function finishPlaySession(
@@ -595,23 +720,29 @@ export async function finishPlaySession(
   songId: string,
   durationS: number,
   sourceId?: string,
+  options?: { creatorId?: string },
 ): Promise<{ ok: boolean; time: number; message: string }> {
   if (durationS <= MIN_REPORT_SECONDS) {
     listenLog("play.skip", `id=${songId} duration=${durationS}s`);
     return { ok: false, time: 0, message: `歌曲过短，未上报 play（需 > ${MIN_REPORT_SECONDS}s）` };
   }
   const time = Math.round(durationS);
-  const play = await weblog(cookie, "play", {
-    type: "song",
-    wifi: 0,
-    download: 0,
-    id: Number(songId),
-    time,
-    end: "playend",
-    source: sourceId ? "list" : "song",
-    sourceId: sourceId || songId,
-    content: `id=${songId}`,
-  });
+  const source: PlayLogSource = { playlistId: sourceId, creatorId: options?.creatorId };
+  const play = await weblog(
+    cookie,
+    "play",
+    {
+      type: "song",
+      wifi: 0,
+      download: 0,
+      id: String(songId),
+      time,
+      end: "playend",
+      content: playLogContent(songId, source),
+      ...playEndSource(songId, source.playlistId),
+    },
+    "play.end",
+  );
   const ok = Number(play.code) === 200 || play.data === "success";
   return { ok, time, message: ok ? "播放上报成功" : JSON.stringify(play) };
 }

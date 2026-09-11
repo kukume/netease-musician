@@ -2,6 +2,8 @@ import { decryptText, newId, nowSec } from "./crypto";
 import {
   assertCookieValid,
   CookieExpiredError,
+  fetchPlayAudio,
+  fetchPlaylistCreator,
   fetchPublicPlaylist,
   fetchUserArtistId,
   finishPlaySession,
@@ -31,10 +33,11 @@ const HEARTBEAT_KEY = "listen_cron";
 export type WakeKind = "start" | "report";
 
 export type ListenQueueMessage = {
-  type: WakeKind;
+  type: WakeKind | "audio";
   accountId: string;
-  token: string;
+  token?: string;
   songId?: string;
+  playUrl?: string;
 };
 
 type QueueAction = "ack" | "retry";
@@ -184,6 +187,10 @@ async function sendWake(env: Env, kind: WakeKind, body: ListenQueueMessage, dela
   await queue.send(body, { delaySeconds });
 }
 
+async function sendAudioFetch(env: Env, accountId: string, songId: string, playUrl: string): Promise<void> {
+  await env.LISTEN_AUDIO.send({ type: "audio", accountId, songId, playUrl }, { delaySeconds: 0 });
+}
+
 async function scheduleWake(
   env: Env,
   accountId: string,
@@ -273,10 +280,10 @@ export async function savePlaylist(env: Env, input: string): Promise<{ name: str
   await env.DB.prepare("DELETE FROM playlist_tracks").run();
   await env.DB.prepare(
     `UPDATE playlist_meta
-     SET playlist_id = ?, name = ?, cover = ?, track_count = ?, cursor = 0, updated_at = ?
+     SET playlist_id = ?, name = ?, cover = ?, track_count = ?, creator_id = ?, cursor = 0, updated_at = ?
      WHERE id = 1`,
   )
-    .bind(info.playlistId, info.name, info.cover, info.tracks.length, nowSec())
+    .bind(info.playlistId, info.name, info.cover, info.tracks.length, info.creatorId, nowSec())
     .run();
 
   for (let i = 0; i < info.tracks.length; i += 40) {
@@ -298,6 +305,7 @@ export async function getPlaylistMeta(env: Env) {
     name: string | null;
     cover: string | null;
     track_count: number;
+    creator_id?: string;
     cursor: number;
     listen_enabled: number;
     listen_started_at?: number;
@@ -350,11 +358,28 @@ async function writeLog(
     .run();
 }
 
+async function resolveCreatorId(env: Env, cookie: string, playlistId: string, stored?: string): Promise<string> {
+  if (stored) return stored;
+  if (!playlistId) return "";
+  try {
+    const creatorId = await fetchPlaylistCreator(cookie, playlistId);
+    if (creatorId) {
+      await env.DB.prepare("UPDATE playlist_meta SET creator_id = ? WHERE id = 1").bind(creatorId).run();
+      listenLog("playlist.creator", `id=${playlistId} creator=${creatorId}`);
+    }
+    return creatorId;
+  } catch (e) {
+    listenLog("playlist.creator.fail", `${playlistId} ${e instanceof Error ? e.message : String(e)}`);
+    return "";
+  }
+}
+
 async function startOneAccount(
   env: Env,
   account: AccountRow,
   playlistId: string,
   trackCount: number,
+  creatorId?: string,
 ): Promise<"started" | "locked" | "expired" | "fail"> {
   const claimed = await env.DB.prepare(
     `UPDATE netease_accounts
@@ -388,6 +413,8 @@ async function startOneAccount(
     await scheduleWake(env, account.id, "start", nextGapSec());
     return "fail";
   }
+
+  const resolvedCreatorId = await resolveCreatorId(env, cookie, playlistId, creatorId);
 
   let artistId = String(account.artist_id || "");
   if (!artistId) {
@@ -437,8 +464,10 @@ async function startOneAccount(
 
     listenLog("start.begin", `${who(account)} idx=${idx} try=${playFails + 1}/${MAX_SONG_TRIES} song=${track.songId} ${track.name} / ${track.artist}`);
     try {
-      const { durationS } = await startPlaySession(cookie, track.songId, {
+      const { durationS, playUrl } = await startPlaySession(cookie, track.songId, {
         fallbackDurationMs: track.duration,
+        playlistId,
+        creatorId: resolvedCreatorId,
       });
       if (durationS <= MIN_REPORT_SECONDS) {
         const message = `歌曲过短，未上报 play（需 > ${MIN_REPORT_SECONDS}s）`;
@@ -485,6 +514,13 @@ async function startOneAccount(
         .bind(idx, startedAt)
         .run();
       try {
+        await sendAudioFetch(env, account.id, track.songId, playUrl);
+        listenLog("audio.enqueue", `${who(account)} song=${track.songId}`);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        listenLog("audio.enqueue-fail", `${who(account)} ${message}`);
+      }
+      try {
         await sendWake(
           env,
           "report",
@@ -530,7 +566,7 @@ async function handleStart(env: Env, body: ListenQueueMessage): Promise<QueueAct
     listenLog("start.skip", `id=${body.accountId.slice(0, 8)} 账号已删除`);
     return "ack";
   }
-  if (account.wake_token !== body.token || account.wake_kind !== "start") {
+  if (!body.token || account.wake_token !== body.token || account.wake_kind !== "start") {
     listenLog("start.stale", `${who(account)} 旧闹钟`);
     return "ack";
   }
@@ -553,7 +589,7 @@ async function handleStart(env: Env, body: ListenQueueMessage): Promise<QueueAct
     return "ack";
   }
 
-  const result = await startOneAccount(env, account, meta.playlist_id, meta.track_count);
+  const result = await startOneAccount(env, account, meta.playlist_id, meta.track_count, meta.creator_id);
   if (result === "locked") {
     const again = await loadAccount(env, account.id);
     if (!again || again.wake_token !== body.token || again.pending_song_id) return "ack";
@@ -568,7 +604,7 @@ async function handleReport(env: Env, body: ListenQueueMessage, attempts: number
     listenLog("report.skip", `id=${body.accountId.slice(0, 8)} 账号已删除`);
     return "ack";
   }
-  if (account.wake_token !== body.token || account.wake_kind !== "report") {
+  if (!body.token || account.wake_token !== body.token || account.wake_kind !== "report") {
     listenLog("report.stale", `${who(account)} 旧闹钟`);
     return "ack";
   }
@@ -625,11 +661,18 @@ async function handleReport(env: Env, body: ListenQueueMessage, attempts: number
   listenLog("report.start", `${who(account)} song=${song.songId} ${song.name} duration=${account.pending_duration}s`);
   try {
     const cookie = await decryptText(env.SESSION_SECRET, account.cookie_enc);
+    const creatorId = await resolveCreatorId(
+      env,
+      cookie,
+      account.pending_source_id || meta?.playlist_id || "",
+      meta?.creator_id,
+    );
     const result = await finishPlaySession(
       cookie,
       song.songId,
       Number(account.pending_duration || 0),
       account.pending_source_id || undefined,
+      { creatorId },
     );
     listenLog("report.done", `${who(account)} ok=${result.ok} ${result.message}`);
     await writeLog(env, account, song, result.ok ? 1 : 0, result.message);
@@ -669,6 +712,26 @@ async function handleReport(env: Env, body: ListenQueueMessage, attempts: number
   }
 }
 
+async function handleAudio(body: ListenQueueMessage): Promise<void> {
+  const playUrl = body.playUrl?.trim();
+  if (!playUrl) {
+    listenLog("audio.skip", `id=${body.accountId.slice(0, 8)} 没有播放地址`);
+    return;
+  }
+  listenLog("audio.start", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"}`);
+  try {
+    const result = await fetchPlayAudio(playUrl);
+    if (result.ok) {
+      listenLog("audio.ok", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"} http=${result.status} bytes=${result.bytes}`);
+      return;
+    }
+    listenLog("audio.fail", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"} http=${result.status} bytes=${result.bytes}`);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    listenLog("audio.fail", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"} ${message}`);
+  }
+}
+
 function retryDelayFor(body: ListenQueueMessage, reportAt?: number): number {
   if (body.type === "report" && reportAt && reportAt > nowSec()) {
     return clampDelay(reportAt - nowSec() + 1);
@@ -676,27 +739,44 @@ function retryDelayFor(body: ListenQueueMessage, reportAt?: number): number {
   return body.type === "report" ? 20 : 30;
 }
 
+function isAudioQueue(queueName: string): boolean {
+  return queueName === "netease-musician-audio";
+}
+
 export async function handleListenQueue(env: Env, batch: MessageBatch<ListenQueueMessage>): Promise<void> {
   listenLog("queue.batch", `queue=${batch.queue} n=${batch.messages.length}`);
+  const audioOnly = isAudioQueue(batch.queue);
   for (const msg of batch.messages) {
     const body = msg.body;
-    if (!body?.accountId || !body.token || (body.type !== "start" && body.type !== "report")) {
+    const type = audioOnly ? "audio" : body?.type;
+    const known = type === "start" || type === "report" || type === "audio";
+    if (!body?.accountId || !known || (type !== "audio" && !body.token)) {
       listenLog("queue.bad", `id=${msg.id}`);
       msg.ack();
       continue;
     }
+    if (type === "audio") {
+      try {
+        await handleAudio(body);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        listenLog("queue.fail", `type=audio id=${body.accountId.slice(0, 8)} ${message}`);
+      }
+      msg.ack();
+      continue;
+    }
     try {
-      const action = body.type === "report" ? await handleReport(env, body, msg.attempts) : await handleStart(env, body);
+      const action = type === "report" ? await handleReport(env, body, msg.attempts) : await handleStart(env, body);
       if (action === "retry") {
         const account = await loadAccount(env, body.accountId);
-        msg.retry({ delaySeconds: retryDelayFor(body, account?.report_at) });
+        msg.retry({ delaySeconds: retryDelayFor({ ...body, type }, account?.report_at) });
       } else {
         msg.ack();
       }
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
-      listenLog("queue.fail", `type=${body.type} id=${body.accountId.slice(0, 8)} ${message}`);
-      msg.retry({ delaySeconds: body.type === "report" ? 20 : 45 });
+      listenLog("queue.fail", `type=${type} id=${body.accountId.slice(0, 8)} ${message}`);
+      msg.retry({ delaySeconds: type === "report" ? 20 : 45 });
     }
   }
 }

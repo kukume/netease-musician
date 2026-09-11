@@ -21,7 +21,8 @@
   "queues": {
     "producers": [
       { "binding": "LISTEN_START", "queue": "netease-musician-start" },
-      { "binding": "LISTEN_REPORT", "queue": "netease-musician-report" }
+      { "binding": "LISTEN_REPORT", "queue": "netease-musician-report" },
+      { "binding": "LISTEN_AUDIO", "queue": "netease-musician-audio" }
     ],
     "consumers": [
       {
@@ -41,6 +42,14 @@
         "max_concurrency": 5,
         "retry_delay": 20,
         "dead_letter_queue": "netease-musician-report-dlq"
+      },
+      {
+        "queue": "netease-musician-audio",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 0,
+        "max_concurrency": 5,
+        "dead_letter_queue": "netease-musician-audio-dlq"
       }
     ]
   },

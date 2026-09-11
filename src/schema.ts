@@ -80,7 +80,8 @@ const STATEMENTS = [
     cursor INTEGER NOT NULL DEFAULT 0,
     listen_enabled INTEGER NOT NULL DEFAULT 1,
     updated_at INTEGER NOT NULL,
-    listen_started_at INTEGER NOT NULL DEFAULT 0
+    listen_started_at INTEGER NOT NULL DEFAULT 0,
+    creator_id TEXT NOT NULL DEFAULT ''
   )`,
   `INSERT OR IGNORE INTO playlist_meta (id, playlist_id, listen_enabled, updated_at) VALUES (1, '', 1, 0)`,
   `CREATE TABLE IF NOT EXISTS playlist_tracks (
@@ -197,6 +198,10 @@ const FILE_MIGRATIONS: { name: string; statements: string[] }[] = [
       "ALTER TABLE netease_accounts ADD COLUMN wake_token TEXT",
       "CREATE INDEX IF NOT EXISTS idx_netease_wake ON netease_accounts(status, wake_at)",
     ],
+  },
+  {
+    name: "0011_playlist_creator.sql",
+    statements: ["ALTER TABLE playlist_meta ADD COLUMN creator_id TEXT NOT NULL DEFAULT ''"],
   },
 ];
 
