@@ -37,9 +37,7 @@ export default {
   },
 
   async queue(batch, env) {
-    // 暂时关闭歌曲下载：不再跳过 netease-musician-audio 的 schema 检查
-    // if (batch.queue !== "netease-musician-audio" && !(await ensureSchema(env))) {
-    if (!(await ensureSchema(env))) {
+    if (batch.queue !== "netease-musician-audio" && !(await ensureSchema(env))) {
       console.log("[listen] queue.skip 数据库未就绪");
       batch.retryAll({ delaySeconds: 30 });
       return;

@@ -62,6 +62,10 @@ npx wrangler secret put SESSION_SECRET
 
 本地写 `.dev.vars`，线上用 Dashboard 或 `wrangler secret put`。
 
+### 歌曲下载
+
+听歌上报不依赖实际拉音频。`LISTEN_AUDIO_ENABLED` 未设置时默认关闭：不向 `netease-musician-audio` 投递、也不下载播放地址。需要打开时在 Dashboard Variables 或 `.dev.vars` 设为 `1` / `true` / `yes` / `on`。
+
 ## 说明
 
 - 每个绑定账号有自己的听歌进度和随机下次开听时间。Cron 每分钟：先给「已经听满一首」的账号上报 `play`（当前时间 ≥ `report_at`），再从到期空闲账号里最多开 6 个新听（取播放地址 → `startplay`，并把 `report_at` 写成现在+歌曲时长）。同一账号有未结束的歌时不会再开下一首。上一分钟如果还在开听或上报，这一分钟直接退出（`work.skip`）。

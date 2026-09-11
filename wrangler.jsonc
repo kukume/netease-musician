@@ -21,9 +21,8 @@
   "queues": {
     "producers": [
       { "binding": "LISTEN_START", "queue": "netease-musician-start" },
-      { "binding": "LISTEN_REPORT", "queue": "netease-musician-report" }
-      // 暂时关闭歌曲下载：不向 netease-musician-audio 投递
-      // { "binding": "LISTEN_AUDIO", "queue": "netease-musician-audio" }
+      { "binding": "LISTEN_REPORT", "queue": "netease-musician-report" },
+      { "binding": "LISTEN_AUDIO", "queue": "netease-musician-audio" }
     ],
     "consumers": [
       {
@@ -43,16 +42,15 @@
         "max_concurrency": 5,
         "retry_delay": 20,
         "dead_letter_queue": "netease-musician-report-dlq"
+      },
+      {
+        "queue": "netease-musician-audio",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 0,
+        "max_concurrency": 5,
+        "dead_letter_queue": "netease-musician-audio-dlq"
       }
-      // 暂时关闭歌曲下载：不消费 netease-musician-audio
-      // {
-      //   "queue": "netease-musician-audio",
-      //   "max_batch_size": 1,
-      //   "max_batch_timeout": 1,
-      //   "max_retries": 0,
-      //   "max_concurrency": 5,
-      //   "dead_letter_queue": "netease-musician-audio-dlq"
-      // }
     ]
   },
   // Dashboard 里配置的明文变量（如 CAP_URL / CAP_SITE_KEY）不要写进 vars。
