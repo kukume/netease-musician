@@ -10,4 +10,6 @@ interface Env {
   EMAIL: SendEmail;
   EMAIL_FROM: string;
   EMAIL_FROM_NAME: string;
+  // 未设置或空值时默认关闭歌曲下载（netease-musician-audio）
+  LISTEN_AUDIO_ENABLED?: string;
 }
