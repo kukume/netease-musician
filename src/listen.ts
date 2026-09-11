@@ -3,7 +3,7 @@ import { sendCookieExpiredEmail } from "./email";
 import {
   assertCookieValid,
   CookieExpiredError,
-  fetchPlayAudio,
+  // fetchPlayAudio, // 暂时关闭歌曲下载
   fetchPlaylistCreator,
   fetchPublicPlaylist,
   fetchUserArtistId,
@@ -188,9 +188,10 @@ async function sendWake(env: Env, kind: WakeKind, body: ListenQueueMessage, dela
   await queue.send(body, { delaySeconds });
 }
 
-async function sendAudioFetch(env: Env, accountId: string, songId: string, playUrl: string): Promise<void> {
-  await env.LISTEN_AUDIO.send({ type: "audio", accountId, songId, playUrl }, { delaySeconds: 0 });
-}
+// 暂时关闭歌曲下载：不向 netease-musician-audio 投递
+// async function sendAudioFetch(env: Env, accountId: string, songId: string, playUrl: string): Promise<void> {
+//   await env.LISTEN_AUDIO.send({ type: "audio", accountId, songId, playUrl }, { delaySeconds: 0 });
+// }
 
 async function scheduleWake(
   env: Env,
@@ -484,7 +485,7 @@ async function startOneAccount(
 
     listenLog("start.begin", `${who(account)} idx=${idx} try=${playFails + 1}/${MAX_SONG_TRIES} song=${track.songId} ${track.name} / ${track.artist}`);
     try {
-      const { durationS, playUrl } = await startPlaySession(cookie, track.songId, {
+      const { durationS /*, playUrl */ } = await startPlaySession(cookie, track.songId, {
         fallbackDurationMs: track.duration,
         playlistId,
         creatorId: resolvedCreatorId,
@@ -533,13 +534,14 @@ async function startOneAccount(
       await env.DB.prepare("UPDATE playlist_meta SET cursor = ?, updated_at = ? WHERE id = 1")
         .bind(idx, startedAt)
         .run();
-      try {
-        await sendAudioFetch(env, account.id, track.songId, playUrl);
-        listenLog("audio.enqueue", `${who(account)} song=${track.songId}`);
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        listenLog("audio.enqueue-fail", `${who(account)} ${message}`);
-      }
+      // 暂时关闭歌曲下载：不向 netease-musician-audio 投递
+      // try {
+      //   await sendAudioFetch(env, account.id, track.songId, playUrl);
+      //   listenLog("audio.enqueue", `${who(account)} song=${track.songId}`);
+      // } catch (e) {
+      //   const message = e instanceof Error ? e.message : String(e);
+      //   listenLog("audio.enqueue-fail", `${who(account)} ${message}`);
+      // }
       try {
         await sendWake(
           env,
@@ -732,25 +734,26 @@ async function handleReport(env: Env, body: ListenQueueMessage, attempts: number
   }
 }
 
-async function handleAudio(body: ListenQueueMessage): Promise<void> {
-  const playUrl = body.playUrl?.trim();
-  if (!playUrl) {
-    listenLog("audio.skip", `id=${body.accountId.slice(0, 8)} 没有播放地址`);
-    return;
-  }
-  listenLog("audio.start", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"}`);
-  try {
-    const result = await fetchPlayAudio(playUrl);
-    if (result.ok) {
-      listenLog("audio.ok", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"} http=${result.status} bytes=${result.bytes}`);
-      return;
-    }
-    listenLog("audio.fail", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"} http=${result.status} bytes=${result.bytes}`);
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    listenLog("audio.fail", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"} ${message}`);
-  }
-}
+// 暂时关闭歌曲下载：不处理 netease-musician-audio 队列
+// async function handleAudio(body: ListenQueueMessage): Promise<void> {
+//   const playUrl = body.playUrl?.trim();
+//   if (!playUrl) {
+//     listenLog("audio.skip", `id=${body.accountId.slice(0, 8)} 没有播放地址`);
+//     return;
+//   }
+//   listenLog("audio.start", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"}`);
+//   try {
+//     const result = await fetchPlayAudio(playUrl);
+//     if (result.ok) {
+//       listenLog("audio.ok", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"} http=${result.status} bytes=${result.bytes}`);
+//       return;
+//     }
+//     listenLog("audio.fail", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"} http=${result.status} bytes=${result.bytes}`);
+//   } catch (e) {
+//     const message = e instanceof Error ? e.message : String(e);
+//     listenLog("audio.fail", `id=${body.accountId.slice(0, 8)} song=${body.songId || "-"} ${message}`);
+//   }
+// }
 
 function retryDelayFor(body: ListenQueueMessage, reportAt?: number): number {
   if (body.type === "report" && reportAt && reportAt > nowSec()) {
@@ -776,12 +779,12 @@ export async function handleListenQueue(env: Env, batch: MessageBatch<ListenQueu
       continue;
     }
     if (type === "audio") {
-      try {
-        await handleAudio(body);
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        listenLog("queue.fail", `type=audio id=${body.accountId.slice(0, 8)} ${message}`);
-      }
+      // try {
+      //   await handleAudio(body);
+      // } catch (e) {
+      //   const message = e instanceof Error ? e.message : String(e);
+      //   listenLog("queue.fail", `type=audio id=${body.accountId.slice(0, 8)} ${message}`);
+      // }
       msg.ack();
       continue;
     }
