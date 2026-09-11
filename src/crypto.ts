@@ -1,6 +1,7 @@
 import {
   createCipheriv,
   createHash,
+  createHmac,
   pbkdf2Sync,
   randomBytes,
   timingSafeEqual,
@@ -90,4 +91,16 @@ export function newId(): string {
 
 export function nowSec(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+export function hmacHex(secret: string, text: string): string {
+  return createHmac("sha256", secret).update(text, "utf8").digest("hex");
+}
+
+export function hmacEquals(secret: string, text: string, expectedHex: string): boolean {
+  if (!/^[0-9a-f]+$/i.test(expectedHex) || expectedHex.length % 2 !== 0) return false;
+  const actual = Buffer.from(hmacHex(secret, text), "hex");
+  const expected = Buffer.from(expectedHex, "hex");
+  if (actual.length !== expected.length) return false;
+  return timingSafeEqual(actual, expected);
 }

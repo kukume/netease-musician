@@ -34,6 +34,19 @@ import { applyPendingMigrations, listMigrations } from "./schema";
 import { getCronHeartbeat, getPlaylistMeta, kickListen, listTracks, onAccountBound, onListenEnabledChange, savePlaylist } from "./listen";
 import { qrToSvg } from "./qr";
 import { publicCapConfig, verifyCapToken } from "./cap";
+import {
+  EMAIL_DAILY_LIMIT,
+  EMAIL_MAX_ATTEMPTS,
+  EMAIL_SEND_GAP_SEC,
+  EMAIL_TTL_SEC,
+  emailSendConfigured,
+  hashEmailCode,
+  isValidEmail,
+  normalizeEmail,
+  randomEmailCode,
+  sendBindCodeEmail,
+  verifyEmailCode,
+} from "./email";
 
 const PAGE_SIZE = 15;
 const SMS_TTL_SEC = 10 * 60;
@@ -47,7 +60,7 @@ function pageParams(request: Request, defaultSize = PAGE_SIZE) {
 }
 
 function publicUser(u: User) {
-  return { id: u.id, username: u.username, role: u.role, status: u.status, createdAt: u.created_at };
+  return { id: u.id, username: u.username, role: u.role, status: u.status, createdAt: u.created_at, email: u.email || "" };
 }
 
 async function upsertNeteaseAccount(
@@ -137,6 +150,9 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     }
     if (method === "POST" && path === "/api/auth/password") return changePassword(env, request);
     if (method === "GET" && path === "/api/me") return me(env, request);
+    if (method === "POST" && path === "/api/email/send") return sendEmailCode(env, request);
+    if (method === "POST" && path === "/api/email/verify") return verifyBindEmail(env, request);
+    if (method === "DELETE" && path === "/api/email") return unbindEmail(env, request);
 
     if (method === "GET" && path === "/api/overview") return overview(env, request);
     if (method === "GET" && path === "/api/logs") return myLogs(env, request);
@@ -209,7 +225,10 @@ async function register(env: Env, request: Request) {
     env.DB.prepare("UPDATE invite_codes SET used_by = ?, used_at = ? WHERE id = ?").bind(id, nowSec(), invite.id),
   ]);
   const token = await createSession(env, id);
-  return ok({ user: { id, username, role: "user", status: "active" } }, { "Set-Cookie": sessionCookie(token) });
+  return ok(
+    { user: publicUser({ id, username, role: "user", status: "active", created_at: nowSec(), email: null }) },
+    { "Set-Cookie": sessionCookie(token) },
+  );
 }
 
 async function login(env: Env, request: Request) {
@@ -218,14 +237,23 @@ async function login(env: Env, request: Request) {
   if (capFail) return capFail;
   const username = (body.username || "").trim();
   const password = body.password || "";
-  const row = await env.DB.prepare("SELECT id, username, password_hash, role, status, created_at FROM users WHERE username = ?")
+  const row = await env.DB.prepare("SELECT id, username, password_hash, role, status, created_at, email FROM users WHERE username = ?")
     .bind(username)
-    .first<{ id: string; username: string; password_hash: string; role: string; status: string; created_at: number }>();
+    .first<{ id: string; username: string; password_hash: string; role: string; status: string; created_at: number; email: string | null }>();
   if (!row || !verifyPassword(password, row.password_hash)) return err("用户名或密码错误", 401);
   if (row.status !== "active") return err("账号已被停用", 403);
   const token = await createSession(env, row.id);
   return ok(
-    { user: publicUser({ id: row.id, username: row.username, role: row.role === "admin" ? "admin" : "user", status: "active", created_at: row.created_at }) },
+    {
+      user: publicUser({
+        id: row.id,
+        username: row.username,
+        role: row.role === "admin" ? "admin" : "user",
+        status: "active",
+        created_at: row.created_at,
+        email: row.email || null,
+      }),
+    },
     { "Set-Cookie": sessionCookie(token) },
   );
 }
@@ -254,6 +282,108 @@ async function changePassword(env: Env, request: Request) {
   const token = parseCookieHeader(request, SESSION_COOKIE);
   await env.DB.prepare("DELETE FROM sessions WHERE user_id = ? AND token != ?").bind(user.id, token).run();
   return ok({ message: "密码已更新" });
+}
+
+async function sendEmailCode(env: Env, request: Request) {
+  const user = await requireUser(env, request);
+  if (user instanceof Response) return user;
+  const configured = emailSendConfigured(env);
+  if (!configured.ok) return err(configured.message);
+  const body = await readJson<{ email?: string }>(request);
+  const email = normalizeEmail(body.email || "");
+  if (!isValidEmail(email)) return err("请填写有效邮箱");
+  if (user.email && user.email === email) return err("该邮箱已绑定");
+  const taken = await env.DB.prepare("SELECT id FROM users WHERE email = ? AND id != ?")
+    .bind(email, user.id)
+    .first<{ id: string }>();
+  if (taken) return err("该邮箱已被其他账号绑定");
+
+  const now = nowSec();
+  const last = await env.DB.prepare("SELECT created_at FROM email_verifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 1")
+    .bind(user.id)
+    .first<{ created_at: number }>();
+  if (last && now - last.created_at < EMAIL_SEND_GAP_SEC) {
+    return err("发送太频繁，请稍后再试");
+  }
+  const dayCount = await env.DB.prepare(
+    "SELECT COUNT(*) as n FROM email_verifications WHERE user_id = ? AND created_at > ?",
+  )
+    .bind(user.id, now - 86400)
+    .first<{ n: number }>();
+  if (Number(dayCount?.n || 0) >= EMAIL_DAILY_LIMIT) return err("今天发送次数过多，请明天再试");
+
+  const code = randomEmailCode();
+  try {
+    await sendBindCodeEmail(env, email, code);
+  } catch (e) {
+    return err(e instanceof Error ? e.message : "发送验证码失败");
+  }
+
+  const id = newId();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM email_verifications WHERE created_at < ?").bind(now - 2 * 86400),
+    env.DB.prepare("UPDATE email_verifications SET expires_at = ? WHERE user_id = ? AND expires_at > ?").bind(now - 1, user.id, now),
+    env.DB.prepare(
+      `INSERT INTO email_verifications (id, user_id, email, code_hash, attempts, created_at, expires_at)
+       VALUES (?, ?, ?, ?, 0, ?, ?)`,
+    ).bind(id, user.id, email, hashEmailCode(env.SESSION_SECRET, email, code), now, now + EMAIL_TTL_SEC),
+  ]);
+  return ok({ id, expiresIn: EMAIL_TTL_SEC, retryAfter: EMAIL_SEND_GAP_SEC });
+}
+
+async function verifyBindEmail(env: Env, request: Request) {
+  const user = await requireUser(env, request);
+  if (user instanceof Response) return user;
+  const body = await readJson<{ id?: string; code?: string }>(request);
+  const id = (body.id || "").trim();
+  const code = (body.code || "").trim();
+  if (!id) return err("请先发送验证码");
+  if (!/^\d{6}$/.test(code)) return err("请输入 6 位验证码");
+  const row = await env.DB.prepare("SELECT * FROM email_verifications WHERE id = ? AND user_id = ?")
+    .bind(id, user.id)
+    .first<{
+      id: string;
+      email: string;
+      code_hash: string;
+      attempts: number;
+      expires_at: number;
+    }>();
+  if (!row) return err("验证码已失效，请重新发送");
+  if (nowSec() > row.expires_at) {
+    return err("验证码已过期，请重新发送");
+  }
+  if (row.attempts >= EMAIL_MAX_ATTEMPTS) {
+    return err("尝试次数过多，请重新发送验证码");
+  }
+  if (!verifyEmailCode(env.SESSION_SECRET, row.email, code, row.code_hash)) {
+    const next = row.attempts + 1;
+    await env.DB.prepare("UPDATE email_verifications SET attempts = ? WHERE id = ?").bind(next, id).run();
+    if (next >= EMAIL_MAX_ATTEMPTS) return err("尝试次数过多，请重新发送验证码");
+    return err("验证码不正确");
+  }
+  const taken = await env.DB.prepare("SELECT id FROM users WHERE email = ? AND id != ?")
+    .bind(row.email, user.id)
+    .first<{ id: string }>();
+  if (taken) {
+    return err("该邮箱已被其他账号绑定");
+  }
+  try {
+    await env.DB.prepare("UPDATE users SET email = ? WHERE id = ?").bind(row.email, user.id).run();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (message.toLowerCase().includes("unique")) return err("该邮箱已被其他账号绑定");
+    throw e;
+  }
+  await env.DB.prepare("UPDATE email_verifications SET expires_at = ? WHERE user_id = ?").bind(nowSec() - 1, user.id).run();
+  return ok({ message: "邮箱已绑定", user: publicUser({ ...user, email: row.email }) });
+}
+
+async function unbindEmail(env: Env, request: Request) {
+  const user = await requireUser(env, request);
+  if (user instanceof Response) return user;
+  if (!user.email) return err("还没有绑定邮箱");
+  await env.DB.prepare("UPDATE users SET email = NULL WHERE id = ?").bind(user.id).run();
+  return ok({ message: "已解除绑定", user: publicUser({ ...user, email: null }) });
 }
 
 async function overview(env: Env, request: Request) {
@@ -518,7 +648,7 @@ async function adminUsers(env: Env, request: Request) {
   const totalRow = await env.DB.prepare("SELECT COUNT(*) as n FROM users").first<{ n: number }>();
   const total = Number(totalRow?.n || 0);
   const { results } = await env.DB.prepare(
-    `SELECT u.id, u.username, u.role, u.status, u.created_at as createdAt,
+    `SELECT u.id, u.username, u.email, u.role, u.status, u.created_at as createdAt,
             (SELECT COUNT(*) FROM netease_accounts a WHERE a.user_id = u.id) as bound
      FROM users u ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
   )
@@ -553,6 +683,7 @@ async function deleteUser(env: Env, request: Request, id: string) {
   await env.DB.batch([
     env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id),
     env.DB.prepare("DELETE FROM netease_accounts WHERE user_id = ?").bind(id),
+    env.DB.prepare("DELETE FROM email_verifications WHERE user_id = ?").bind(id),
     env.DB.prepare("DELETE FROM users WHERE id = ?").bind(id),
   ]);
   return ok();

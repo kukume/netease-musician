@@ -7,4 +7,7 @@ interface Env {
   CAP_URL: string;
   CAP_SITE_KEY: string;
   CAP_SECRET_KEY: string;
+  EMAIL: SendEmail;
+  EMAIL_FROM: string;
+  EMAIL_FROM_NAME: string;
 }

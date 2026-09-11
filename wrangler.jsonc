@@ -56,6 +56,9 @@
   // Dashboard 里配置的明文变量（如 CAP_URL / CAP_SITE_KEY）不要写进 vars。
   // wrangler.jsonc 里的空字符串每次部署都会覆盖 Dashboard。
   "keep_vars": true,
+  "send_email": [
+    { "name": "EMAIL" }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

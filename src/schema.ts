@@ -6,7 +6,8 @@ const STATEMENTS = [
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'user',
     status TEXT NOT NULL DEFAULT 'active',
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    email TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
@@ -125,6 +126,18 @@ const STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_netease_report ON netease_accounts(status, report_at)`,
   `CREATE INDEX IF NOT EXISTS idx_netease_wake ON netease_accounts(status, wake_at)`,
   `CREATE INDEX IF NOT EXISTS idx_sms_sessions_user ON sms_sessions(user_id)`,
+  `CREATE TABLE IF NOT EXISTS email_verifications (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_email_verifications_user ON email_verifications(user_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL`,
 ];
 
 /** Bundled copies of migrations/*.sql so the Worker can apply them without wrangler CLI. */
@@ -202,6 +215,24 @@ const FILE_MIGRATIONS: { name: string; statements: string[] }[] = [
   {
     name: "0011_playlist_creator.sql",
     statements: ["ALTER TABLE playlist_meta ADD COLUMN creator_id TEXT NOT NULL DEFAULT ''"],
+  },
+  {
+    name: "0012_user_email.sql",
+    statements: [
+      "ALTER TABLE users ADD COLUMN email TEXT",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL",
+      `CREATE TABLE IF NOT EXISTS email_verifications (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        email TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )`,
+      "CREATE INDEX IF NOT EXISTS idx_email_verifications_user ON email_verifications(user_id)",
+    ],
   },
 ];
 

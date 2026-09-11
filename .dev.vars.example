@@ -7,3 +7,8 @@ SESSION_SECRET=please-change-this-to-a-long-random-string
 # CAP_URL=https://cap.example.com
 # CAP_SITE_KEY=
 # CAP_SECRET_KEY=
+
+# Cloudflare Email Sending（绑定用户邮箱时发验证码）
+# 任意外部邮箱需要 Workers Paid 并在 Dashboard 开通 Email Sending、接入发信域名。
+# EMAIL_FROM=noreply@yourdomain.com
+# EMAIL_FROM_NAME=云村互助

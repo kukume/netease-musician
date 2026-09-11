@@ -9,6 +9,7 @@ export type User = {
   role: "admin" | "user";
   status: "active" | "disabled";
   created_at: number;
+  email: string | null;
 };
 
 export function json(data: unknown, status = 200, extra?: HeadersInit): Response {
@@ -76,12 +77,12 @@ export async function bootstrapAdmin(env: Env): Promise<void> {
 export async function getUserByToken(env: Env, token: string): Promise<User | null> {
   if (!token) return null;
   const row = await env.DB.prepare(
-    `SELECT u.id, u.username, u.role, u.status, u.created_at
+    `SELECT u.id, u.username, u.role, u.status, u.created_at, u.email
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = ? AND s.expires_at > ?`,
   )
     .bind(token, nowSec())
-    .first<{ id: string; username: string; role: string; status: string; created_at: number }>();
+    .first<{ id: string; username: string; role: string; status: string; created_at: number; email: string | null }>();
   if (!row || row.status !== "active") return null;
   return {
     id: row.id,
@@ -89,6 +90,7 @@ export async function getUserByToken(env: Env, token: string): Promise<User | nu
     role: row.role === "admin" ? "admin" : "user",
     status: "active",
     created_at: row.created_at,
+    email: row.email || null,
   };
 }
 

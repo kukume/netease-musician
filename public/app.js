@@ -192,7 +192,7 @@ function renderAuth(mode = "login") {
             <label>用户名</label>
             <input name="username" autocomplete="username" required placeholder="3-20 位字母数字" />
             <label>密码</label>
-            <input name="password" type="password" autocomplete="${mode === "login" ? "current-password" : "new-password"}" required />
+            <input name="password" type="password" autocomplete="${mode === "login" ? "current-password" : "new-password"}" required placeholder="至少 6 位" />
             ${
               mode === "register"
                 ? `<label>邀请码</label><input name="inviteCode" required placeholder="向管理员索取" />`
@@ -253,6 +253,7 @@ function renderApp() {
         <div class="userchip">
           <span>${escapeHtml(state.user.username)} · ${isAdmin ? "管理员" : "成员"}</span>
           <button class="btn ghost small" id="theme-toggle" type="button">${themeToggleLabel()}</button>
+          <button class="btn ghost small" id="bind-email">${state.user.email ? escapeHtml(state.user.email) : "绑定邮箱"}</button>
           <button class="btn ghost small" id="change-password">修改密码</button>
           <button class="btn ghost small" id="logout">退出</button>
         </div>
@@ -265,6 +266,7 @@ function renderApp() {
     </div>
   `;
   bindThemeToggle();
+  $("#bind-email").onclick = openEmailModal;
   $("#change-password").onclick = openPasswordModal;
   $("#logout").onclick = async () => {
     await api("/api/auth/logout", { method: "POST" });
@@ -406,13 +408,14 @@ function renderAdmin() {
         <h2>用户管理</h2>
         <div class="table-wrap">
         <table class="table">
-          <thead><tr><th>用户</th><th>角色</th><th class="col-center">状态</th><th>绑定</th><th></th></tr></thead>
+          <thead><tr><th>用户</th><th>邮箱</th><th>角色</th><th class="col-center">状态</th><th>绑定</th><th></th></tr></thead>
           <tbody>
             ${(state.admin.users || [])
               .map(
                 (u) => `
               <tr>
                 <td>${escapeHtml(u.username)}</td>
+                <td>${escapeHtml(u.email || "未绑定")}</td>
                 <td>${u.role === "admin" ? "管理员" : "成员"}</td>
                 <td class="col-center"><span class="badge ${u.status === "active" ? "" : "bad"}">${u.status === "active" ? "正常" : "停用"}</span></td>
                 <td>${u.bound}</td>
@@ -714,6 +717,123 @@ async function patchUserStatus(id, status) {
   await loadAdmin();
 }
 
+function startSendCountdown(btn, seconds, label = "发送验证码") {
+  let left = seconds;
+  btn.disabled = true;
+  btn.textContent = `${left}s`;
+  const timer = setInterval(() => {
+    left -= 1;
+    if (!btn.isConnected || left <= 0) {
+      clearInterval(timer);
+      btn.disabled = false;
+      btn.textContent = label;
+      return;
+    }
+    btn.textContent = `${left}s`;
+  }, 1000);
+}
+
+function openEmailModal() {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.dataset.emailId = "";
+  const bound = state.user.email || "";
+  wrap.innerHTML = `
+    <div class="modal">
+      <h2>${bound ? "更换邮箱" : "绑定邮箱"}</h2>
+      ${bound ? `<div class="muted" style="margin-bottom:12px">当前：${escapeHtml(bound)}</div>` : ""}
+      <label for="bind-email-input">邮箱</label>
+      <div class="sms-row">
+        <input id="bind-email-input" type="email" autocomplete="email" placeholder="you@example.com">
+        <button type="button" class="btn small ghost" id="email-send">发送验证码</button>
+      </div>
+      <label for="email-code">验证码</label>
+      <input id="email-code" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位验证码">
+      <button type="button" class="btn" id="email-verify">确认绑定</button>
+      ${bound ? `<button type="button" class="btn ghost" id="email-unbind">解除绑定</button>` : ""}
+      <button class="btn ghost" type="button" id="close-email">取消</button>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  $("#close-email", wrap).onclick = () => wrap.remove();
+  wrap.addEventListener("click", (e) => {
+    if (e.target === wrap) wrap.remove();
+  });
+  $("#email-send", wrap).onclick = () => sendEmailCodeUi(wrap);
+  $("#email-verify", wrap).onclick = () => verifyEmailUi(wrap);
+  const unbindBtn = $("#email-unbind", wrap);
+  if (unbindBtn) unbindBtn.onclick = () => unbindEmailUi(wrap);
+  $("#bind-email-input", wrap).onkeydown = (e) => {
+    if (e.key === "Enter") sendEmailCodeUi(wrap);
+  };
+  $("#email-code", wrap).onkeydown = (e) => {
+    if (e.key === "Enter") verifyEmailUi(wrap);
+  };
+}
+
+async function sendEmailCodeUi(wrap) {
+  const email = ($("#bind-email-input", wrap).value || "").trim();
+  if (!email) {
+    toast("请输入邮箱", "error");
+    return;
+  }
+  const btn = $("#email-send", wrap);
+  btn.disabled = true;
+  try {
+    const data = await api("/api/email/send", { method: "POST", body: { email } });
+    wrap.dataset.emailId = data.id || "";
+    toast("验证码已发送，请查收邮件");
+    startSendCountdown(btn, data.retryAfter || 60);
+    $("#email-code", wrap).focus();
+  } catch (err) {
+    toast(err.message, "error");
+    btn.disabled = false;
+    btn.textContent = "发送验证码";
+  }
+}
+
+async function verifyEmailUi(wrap) {
+  const btn = $("#email-verify", wrap);
+  const code = ($("#email-code", wrap).value || "").trim();
+  const id = wrap.dataset.emailId || "";
+  if (!id) {
+    toast("请先发送验证码", "error");
+    return;
+  }
+  if (!code) {
+    toast("请输入验证码", "error");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const data = await api("/api/email/verify", { method: "POST", body: { id, code } });
+    if (data.user) state.user = { ...state.user, ...data.user };
+    toast("邮箱已绑定");
+    wrap.remove();
+    render();
+  } catch (err) {
+    toast(err.message, "error");
+    btn.disabled = false;
+  }
+}
+
+async function unbindEmailUi(wrap) {
+  if (!confirm("确定解除绑定该邮箱？")) return;
+  const btn = $("#email-unbind", wrap);
+  btn.disabled = true;
+  try {
+    const data = await api("/api/email", { method: "DELETE" });
+    if (data.user) state.user = { ...state.user, ...data.user };
+    else state.user = { ...state.user, email: "" };
+    toast("已解除绑定");
+    wrap.remove();
+    render();
+  } catch (err) {
+    toast(err.message, "error");
+    btn.disabled = false;
+  }
+}
+
 function openPasswordModal() {
   const wrap = document.createElement("div");
   wrap.className = "modal-bg";
@@ -847,20 +967,7 @@ async function bindWithCookie(wrap) {
 }
 
 function startSmsCountdown(wrap, seconds) {
-  const btn = $("#sms-send", wrap);
-  let left = seconds;
-  btn.disabled = true;
-  btn.textContent = `${left}s`;
-  const timer = setInterval(() => {
-    left -= 1;
-    if (!wrap.isConnected || left <= 0) {
-      clearInterval(timer);
-      btn.disabled = false;
-      btn.textContent = "发送验证码";
-      return;
-    }
-    btn.textContent = `${left}s`;
-  }, 1000);
+  startSendCountdown($("#sms-send", wrap), seconds);
 }
 
 async function sendSmsCodeUi(wrap) {
