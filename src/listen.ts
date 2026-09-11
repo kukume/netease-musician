@@ -1,4 +1,5 @@
 import { decryptText, newId, nowSec } from "./crypto";
+import { sendCookieExpiredEmail } from "./email";
 import {
   assertCookieValid,
   CookieExpiredError,
@@ -246,11 +247,30 @@ export async function onAccountBound(
   await scheduleWake(env, account.id, "start", bindStartDelaySec());
 }
 
+async function notifyCookieExpired(env: Env, accountId: string): Promise<void> {
+  const row = await env.DB.prepare(
+    `SELECT a.status as status, a.nickname as nickname, u.email as email
+     FROM netease_accounts a JOIN users u ON u.id = a.user_id
+     WHERE a.id = ?`,
+  )
+    .bind(accountId)
+    .first<{ status: string; nickname: string | null; email: string | null }>();
+  if (!row || row.status === "expired" || !row.email) return;
+  try {
+    await sendCookieExpiredEmail(env, row.email, row.nickname || "");
+    listenLog("email.expire.ok", `id=${accountId.slice(0, 8)} to=${row.email}`);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    listenLog("email.expire.fail", `id=${accountId.slice(0, 8)} ${message}`);
+  }
+}
+
 async function clearPending(
   env: Env,
   accountId: string,
   opts: { expired: boolean; message: string; nextListenAt?: number; listenCursor?: number },
 ): Promise<void> {
+  if (opts.expired) await notifyCookieExpired(env, accountId);
   await env.DB.prepare(
     `UPDATE netease_accounts
      SET status = ?, last_listen_at = ?, last_error = ?,
