@@ -66,13 +66,15 @@ npx wrangler secret put SESSION_SECRET
 
 绑定邮箱和 Cookie 失效通知会走 Cloudflare Email Sending（`send_email` 绑定）。**免费 Workers 只能发给账号里已验证的目标地址**；任意外部邮箱需要 Workers Paid 并开通 Email Sending、接入发信域名。
 
-如果还在免费档，配置 `RESEND_API_KEY` 即可兜底：Cloudflare 因「不能发给任意邮箱」失败时，会改用 [Resend](https://resend.com) 发信。发信地址仍用 `EMAIL_FROM` / `EMAIL_FROM_NAME`（Resend 未验证域名时可用 `onboarding@resend.dev`）。
+如果还在免费档，配置 `RESEND_API_KEY` 即可兜底：Cloudflare 因「不能发给任意邮箱」失败时，会改用 [Resend](https://resend.com) 发信。Resend 的发信地址用 **`RESEND_FROM`**，和 Cloudflare 的 `EMAIL_FROM` 分开。
+
+不填 `RESEND_FROM` 时用 Resend 默认测试域名 `onboarding@resend.dev`（**不用绑自己的域名**）。这个地址只能发给 Resend 账号自己的邮箱；要发给任意用户，需要在 Resend 验证域名，并把 `RESEND_FROM` 设成该域名下的地址。显示名仍用 `EMAIL_FROM_NAME`（没有则用「云村互助」）。
 
 ```bash
 npx wrangler secret put RESEND_API_KEY
 ```
 
-本地写在 `.dev.vars`。不要把 API key 写进 `wrangler.jsonc`。
+`RESEND_FROM` 可在 Dashboard Variables 或 `.dev.vars` 填写。不要把 API key 写进 `wrangler.jsonc`。
 
 ### 歌曲下载
 
