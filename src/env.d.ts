@@ -10,6 +10,8 @@ interface Env {
   EMAIL: SendEmail;
   EMAIL_FROM: string;
   EMAIL_FROM_NAME: string;
+  // 免费 Workers 不能向任意邮箱发信时，用 Resend 兜底（Dashboard Secret）
+  RESEND_API_KEY?: string;
   // 未设置或空值时默认关闭歌曲下载（netease-musician-audio）
   LISTEN_AUDIO_ENABLED?: string;
 }

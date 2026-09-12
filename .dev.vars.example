@@ -14,5 +14,8 @@ SESSION_SECRET=please-change-this-to-a-long-random-string
 
 # Cloudflare Email Sending（绑定用户邮箱时发验证码）
 # 任意外部邮箱需要 Workers Paid 并在 Dashboard 开通 Email Sending、接入发信域名。
+# 免费档会拒绝未验证的收件人：可设置 RESEND_API_KEY，失败时改走 Resend。
+# EMAIL_FROM 未验证域名时可用 Resend 测试地址 onboarding@resend.dev。
 # EMAIL_FROM=noreply@yourdomain.com
 # EMAIL_FROM_NAME=云村互助
+# RESEND_API_KEY=re_xxxxxxxxx

@@ -29,16 +29,32 @@ export function verifyEmailCode(secret: string, email: string, code: string, exp
   return hmacEquals(secret, `${email}\n${code}`, expectedHex);
 }
 
-function senderFrom(env: Env): string | { email: string; name: string } | null {
+type EmailFrom = string | { email: string; name: string };
+
+function senderFrom(env: Env): EmailFrom | null {
   const email = (env.EMAIL_FROM || "").trim();
   if (!email || !isValidEmail(normalizeEmail(email))) return null;
   const name = (env.EMAIL_FROM_NAME || "").trim();
   return name ? { email, name } : email;
 }
 
-export function emailSendConfigured(env: Env): { ok: true; from: string | { email: string; name: string } } | { ok: false; message: string } {
-  if (typeof env.EMAIL?.send !== "function") {
-    return { ok: false, message: "未配置邮件绑定，请在 wrangler 中加入 send_email 后重新部署" };
+function resendApiKey(env: Env): string {
+  return (env.RESEND_API_KEY || "").trim();
+}
+
+function hasCloudflareEmail(env: Env): boolean {
+  return typeof env.EMAIL?.send === "function";
+}
+
+function formatFromAddress(from: EmailFrom): string {
+  return typeof from === "string" ? from : `${from.name} <${from.email}>`;
+}
+
+export function emailSendConfigured(env: Env): { ok: true; from: EmailFrom } | { ok: false; message: string } {
+  const hasCf = hasCloudflareEmail(env);
+  const hasResend = Boolean(resendApiKey(env));
+  if (!hasCf && !hasResend) {
+    return { ok: false, message: "未配置发信：请在 wrangler 中加入 send_email，或设置环境变量 RESEND_API_KEY" };
   }
   const from = senderFrom(env);
   if (!from) return { ok: false, message: "未配置发信地址 EMAIL_FROM" };
@@ -52,13 +68,26 @@ function sendErrorCode(error: unknown): string {
   return "";
 }
 
+function isCfArbitrarySendBlocked(error: unknown): boolean {
+  const code = sendErrorCode(error);
+  if (
+    code === "E_RECIPIENT_NOT_ALLOWED" ||
+    code === "E_SENDER_NOT_VERIFIED" ||
+    code === "E_SENDER_DOMAIN_NOT_AVAILABLE"
+  ) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : "";
+  return /E_RECIPIENT_NOT_ALLOWED|recipient not allowed/i.test(message);
+}
+
 export function emailSendErrorMessage(error: unknown): string {
   switch (sendErrorCode(error)) {
     case "E_RECIPIENT_NOT_ALLOWED":
-      return "无法向该邮箱发信。免费档只能发给账号里已验证的目标地址；任意邮箱需要 Workers Paid 并开通 Email Sending。";
+      return "无法向该邮箱发信。免费档只能发给账号里已验证的目标地址；任意邮箱需要 Workers Paid 并开通 Email Sending，或配置 RESEND_API_KEY 使用 Resend。";
     case "E_SENDER_NOT_VERIFIED":
     case "E_SENDER_DOMAIN_NOT_AVAILABLE":
-      return "发信域名未开通或未验证，请在 Cloudflare Email Sending 完成域名接入。";
+      return "发信域名未开通或未验证，请在 Cloudflare Email Sending 完成域名接入，或配置 RESEND_API_KEY 使用 Resend。";
     case "E_RATE_LIMIT_EXCEEDED":
     case "E_DAILY_LIMIT_EXCEEDED":
       return "发信次数过多，请稍后再试";
@@ -72,19 +101,75 @@ export function emailSendErrorMessage(error: unknown): string {
   }
 }
 
+/** Resend REST API, same as `new Resend(apiKey).emails.send({ from, to, subject, html })`. */
+async function sendViaResend(
+  env: Env,
+  from: EmailFrom,
+  to: string,
+  subject: string,
+  text: string,
+  html: string,
+): Promise<void> {
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${resendApiKey(env)}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: formatFromAddress(from),
+      to: [to],
+      subject,
+      text,
+      html,
+    }),
+  });
+  if (response.ok) return;
+  const raw = await response.text();
+  let detail = "";
+  try {
+    const body = JSON.parse(raw) as { message?: unknown };
+    if (typeof body.message === "string") detail = body.message.trim();
+  } catch {
+    detail = raw.trim();
+  }
+  throw new Error(detail || `Resend 发信失败（HTTP ${response.status}）`);
+}
+
 export async function sendAppEmail(env: Env, to: string, subject: string, text: string, html?: string): Promise<void> {
   const configured = emailSendConfigured(env);
   if (!configured.ok) throw new Error(configured.message);
+  const htmlBody = html || text.replaceAll("\n", "<br>");
+  const canResend = Boolean(resendApiKey(env));
+
+  if (hasCloudflareEmail(env)) {
+    try {
+      await env.EMAIL.send({
+        to,
+        from: configured.from,
+        subject,
+        text,
+        html: htmlBody,
+      });
+      return;
+    } catch (error) {
+      if (canResend && isCfArbitrarySendBlocked(error)) {
+        console.warn("[email] Cloudflare 无法向任意地址发信，改用 Resend", sendErrorCode(error) || error);
+        try {
+          await sendViaResend(env, configured.from, to, subject, text, htmlBody);
+          return;
+        } catch (resendError) {
+          throw new Error(resendError instanceof Error && resendError.message ? resendError.message : "发送邮件失败");
+        }
+      }
+      throw new Error(emailSendErrorMessage(error));
+    }
+  }
+
   try {
-    await env.EMAIL.send({
-      to,
-      from: configured.from,
-      subject,
-      text,
-      html: html || text.replaceAll("\n", "<br>"),
-    });
+    await sendViaResend(env, configured.from, to, subject, text, htmlBody);
   } catch (error) {
-    throw new Error(emailSendErrorMessage(error));
+    throw new Error(error instanceof Error && error.message ? error.message : "发送邮件失败");
   }
 }
 
