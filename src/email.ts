@@ -31,11 +31,26 @@ export function verifyEmailCode(secret: string, email: string, code: string, exp
 
 type EmailFrom = string | { email: string; name: string };
 
+/** Resend 未验证自定义域名时可用的测试发信地址。 */
+export const RESEND_DEFAULT_FROM = "onboarding@resend.dev";
+const DEFAULT_FROM_NAME = "云村互助";
+
 function senderFrom(env: Env): EmailFrom | null {
   const email = (env.EMAIL_FROM || "").trim();
   if (!email || !isValidEmail(normalizeEmail(email))) return null;
   const name = (env.EMAIL_FROM_NAME || "").trim();
   return name ? { email, name } : email;
+}
+
+function fromDisplayName(env: Env): string {
+  return (env.EMAIL_FROM_NAME || "").trim() || DEFAULT_FROM_NAME;
+}
+
+function resendSenderFrom(env: Env): EmailFrom {
+  const email = (env.RESEND_FROM || "").trim();
+  const name = fromDisplayName(env);
+  if (email && isValidEmail(normalizeEmail(email))) return { email, name };
+  return { email: RESEND_DEFAULT_FROM, name };
 }
 
 function resendApiKey(env: Env): string {
@@ -50,15 +65,15 @@ function formatFromAddress(from: EmailFrom): string {
   return typeof from === "string" ? from : `${from.name} <${from.email}>`;
 }
 
-export function emailSendConfigured(env: Env): { ok: true; from: EmailFrom } | { ok: false; message: string } {
+export function emailSendConfigured(env: Env): { ok: true } | { ok: false; message: string } {
   const hasCf = hasCloudflareEmail(env);
   const hasResend = Boolean(resendApiKey(env));
   if (!hasCf && !hasResend) {
     return { ok: false, message: "未配置发信：请在 wrangler 中加入 send_email，或设置环境变量 RESEND_API_KEY" };
   }
-  const from = senderFrom(env);
-  if (!from) return { ok: false, message: "未配置发信地址 EMAIL_FROM" };
-  return { ok: true, from };
+  if (hasResend) return { ok: true };
+  if (!senderFrom(env)) return { ok: false, message: "未配置发信地址 EMAIL_FROM" };
+  return { ok: true };
 }
 
 function sendErrorCode(error: unknown): string {
@@ -133,7 +148,20 @@ async function sendViaResend(
   } catch {
     detail = raw.trim();
   }
+  if (/only send testing emails to your own email address/i.test(detail)) {
+    throw new Error(
+      "Resend 默认域名 onboarding@resend.dev 只能发给账号自己的邮箱。要发给任意用户，请验证域名并设置 RESEND_FROM。",
+    );
+  }
   throw new Error(detail || `Resend 发信失败（HTTP ${response.status}）`);
+}
+
+async function sendAppEmailViaResend(env: Env, to: string, subject: string, text: string, html: string): Promise<void> {
+  try {
+    await sendViaResend(env, resendSenderFrom(env), to, subject, text, html);
+  } catch (error) {
+    throw new Error(error instanceof Error && error.message ? error.message : "发送邮件失败");
+  }
 }
 
 export async function sendAppEmail(env: Env, to: string, subject: string, text: string, html?: string): Promise<void> {
@@ -141,12 +169,13 @@ export async function sendAppEmail(env: Env, to: string, subject: string, text: 
   if (!configured.ok) throw new Error(configured.message);
   const htmlBody = html || text.replaceAll("\n", "<br>");
   const canResend = Boolean(resendApiKey(env));
+  const cfFrom = senderFrom(env);
 
-  if (hasCloudflareEmail(env)) {
+  if (hasCloudflareEmail(env) && cfFrom) {
     try {
       await env.EMAIL.send({
         to,
-        from: configured.from,
+        from: cfFrom,
         subject,
         text,
         html: htmlBody,
@@ -155,22 +184,14 @@ export async function sendAppEmail(env: Env, to: string, subject: string, text: 
     } catch (error) {
       if (canResend && isCfArbitrarySendBlocked(error)) {
         console.warn("[email] Cloudflare 无法向任意地址发信，改用 Resend", sendErrorCode(error) || error);
-        try {
-          await sendViaResend(env, configured.from, to, subject, text, htmlBody);
-          return;
-        } catch (resendError) {
-          throw new Error(resendError instanceof Error && resendError.message ? resendError.message : "发送邮件失败");
-        }
+        await sendAppEmailViaResend(env, to, subject, text, htmlBody);
+        return;
       }
       throw new Error(emailSendErrorMessage(error));
     }
   }
 
-  try {
-    await sendViaResend(env, configured.from, to, subject, text, htmlBody);
-  } catch (error) {
-    throw new Error(error instanceof Error && error.message ? error.message : "发送邮件失败");
-  }
+  await sendAppEmailViaResend(env, to, subject, text, htmlBody);
 }
 
 export async function sendBindCodeEmail(env: Env, to: string, code: string): Promise<void> {

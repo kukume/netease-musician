@@ -12,6 +12,8 @@ interface Env {
   EMAIL_FROM_NAME: string;
   // 免费 Workers 不能向任意邮箱发信时，用 Resend 兜底（Dashboard Secret）
   RESEND_API_KEY?: string;
+  // Resend 发信地址。未设置时用 onboarding@resend.dev（只能发给 Resend 账号自己的邮箱）
+  RESEND_FROM?: string;
   // 未设置或空值时默认关闭歌曲下载（netease-musician-audio）
   LISTEN_AUDIO_ENABLED?: string;
 }
