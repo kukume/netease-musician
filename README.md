@@ -62,6 +62,18 @@ npx wrangler secret put SESSION_SECRET
 
 本地写 `.dev.vars`，线上用 Dashboard 或 `wrangler secret put`。
 
+### 邮件（验证码 / Cookie 失效通知）
+
+绑定邮箱和 Cookie 失效通知会走 Cloudflare Email Sending（`send_email` 绑定）。**免费 Workers 只能发给账号里已验证的目标地址**；任意外部邮箱需要 Workers Paid 并开通 Email Sending、接入发信域名。
+
+如果还在免费档，配置 `RESEND_API_KEY` 即可兜底：Cloudflare 因「不能发给任意邮箱」失败时，会改用 [Resend](https://resend.com) 发信。发信地址仍用 `EMAIL_FROM` / `EMAIL_FROM_NAME`（Resend 未验证域名时可用 `onboarding@resend.dev`）。
+
+```bash
+npx wrangler secret put RESEND_API_KEY
+```
+
+本地写在 `.dev.vars`。不要把 API key 写进 `wrangler.jsonc`。
+
 ### 歌曲下载
 
 听歌上报不依赖实际拉音频。`LISTEN_AUDIO_ENABLED` 未设置时默认关闭：不向 `netease-musician-audio` 投递、也不下载播放地址。需要打开时在 Dashboard Variables 或 `.dev.vars` 设为 `1` / `true` / `yes` / `on`。
