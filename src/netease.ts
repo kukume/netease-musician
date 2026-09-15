@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { md5 } from "./crypto";
+import { uploadPld, uploadPlv } from "./ncbl";
 import { weapiEncrypt } from "./weapi";
 
 export const ORIGIN = "https://music.163.com";
@@ -8,7 +9,7 @@ export const UA =
 
 const PLAYER_URL = ORIGIN + "/weapi/song/enhance/player/url/v1";
 const ACCOUNT_GET = "/weapi/w/nuser/account/get";
-const WEBLOG_URL = "https://clientlogusf.music.163.com/weapi/feedback/weblog";
+// const WEBLOG_URL = "https://clientlogusf.music.163.com/weapi/feedback/weblog";
 const DEVICE_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 export class QrWaitError extends Error {
@@ -568,42 +569,59 @@ export async function fetchPublicPlaylist(playlistId: string): Promise<PlaylistI
   return fetchPlaylist(cookie, playlistId);
 }
 
-async function weblog(
-  cookie: string,
-  action: string,
-  js: Record<string, unknown>,
-  label?: string,
-): Promise<Record<string, unknown>> {
-  const payload = {
-    logs: JSON.stringify([
-      {
-        action,
-        json: { ...js, mainsite: "1", mainsiteWeb: "1" },
-      },
-    ]),
-  };
-  const { json } = await weapiPost(WEBLOG_URL, payload, cookie, { loginSensitive: true });
-  listenLog(`weblog.${label || action}`, compactJson(json));
-  return json;
+// async function weblog(
+//   cookie: string,
+//   action: string,
+//   js: Record<string, unknown>,
+//   label?: string,
+// ): Promise<Record<string, unknown>> {
+//   const payload = {
+//     logs: JSON.stringify([
+//       {
+//         action,
+//         json: { ...js, mainsite: "1", mainsiteWeb: "1" },
+//       },
+//     ]),
+//   };
+//   const { json } = await weapiPost(WEBLOG_URL, payload, cookie, { loginSensitive: true });
+//   listenLog(`weblog.${label || action}`, compactJson(json));
+//   return json;
+// }
+//
+// /** 官网把 content 写成当前页 query：id=歌单&creatorId=&sharedId= */
+// function playLogContent(songId: string, source?: PlayLogSource): string {
+//   const playlistId = source?.playlistId;
+//   if (playlistId && source?.creatorId) {
+//     return `id=${playlistId}&creatorId=${source.creatorId}&sharedId=${source.creatorId}`;
+//   }
+//   return `id=${playlistId || songId}`;
+// }
+//
+// function playOpenSource(songId: string, playlistId?: string): Record<string, unknown> {
+//   if (playlistId) return { source: "list", sourceid: playlistId };
+//   return { source: "song", sourceid: songId };
+// }
+//
+// function playEndSource(songId: string, playlistId?: string): Record<string, unknown> {
+//   if (playlistId) return { source: "list", sourceId: playlistId };
+//   return { source: "song", sourceId: songId };
+// }
+
+function playSource(songId: string, playlistId?: string) {
+  if (playlistId) return { id: playlistId, type: "track", name: "list" };
+  return { id: songId, type: "track", name: "song" };
 }
 
-/** 官网把 content 写成当前页 query：id=歌单&creatorId=&sharedId= */
-function playLogContent(songId: string, source?: PlayLogSource): string {
-  const playlistId = source?.playlistId;
-  if (playlistId && source?.creatorId) {
-    return `id=${playlistId}&creatorId=${source.creatorId}&sharedId=${source.creatorId}`;
+function throwIfNcblExpired(status: number, json?: Record<string, unknown>) {
+  if (status === 401 || status === 403) {
+    listenLog("cookie.expired", `http=${status}`);
+    throw new CookieExpiredError();
   }
-  return `id=${playlistId || songId}`;
-}
-
-function playOpenSource(songId: string, playlistId?: string): Record<string, unknown> {
-  if (playlistId) return { source: "list", sourceid: playlistId };
-  return { source: "song", sourceid: songId };
-}
-
-function playEndSource(songId: string, playlistId?: string): Record<string, unknown> {
-  if (playlistId) return { source: "list", sourceId: playlistId };
-  return { source: "song", sourceId: songId };
+  const code = Number(json?.code ?? 0);
+  if (EXPIRED_CODES.has(code)) {
+    listenLog("cookie.expired", `code=${code}`);
+    throw new CookieExpiredError();
+  }
 }
 
 function toHttps(url: string): string {
@@ -674,17 +692,26 @@ export async function startPlaySession(
     cookie,
     { loginSensitive: true },
   );
-  await weblog(
+  // await weblog(
+  //   cookie,
+  //   "play",
+  //   {
+  //     id: String(songId),
+  //     type: "song",
+  //     content: playLogContent(songId, source),
+  //     ...playOpenSource(songId, source.playlistId),
+  //   },
+  //   "play.open",
+  // );
+  const fallbackS = Math.max(0, Number(options?.fallbackDurationMs || 0) / 1000);
+  const plv = await uploadPlv(
     cookie,
-    "play",
-    {
-      id: String(songId),
-      type: "song",
-      content: playLogContent(songId, source),
-      ...playOpenSource(songId, source.playlistId),
-    },
-    "play.open",
+    { id: songId, time: fallbackS, level },
+    playSource(songId, source.playlistId),
   );
+  throwIfNcblExpired(plv.status, plv.body);
+  listenLog("plv.open", `id=${songId} http=${plv.status} ${compactJson(plv.body)}`);
+  if (!plv.ok) throw new Error(`PLV 上报失败 ${compactJson(plv.body)}`);
   if (source.playlistId) {
     try {
       await bumpPlaylistPlaycount(cookie, source.playlistId);
@@ -730,21 +757,31 @@ export async function finishPlaySession(
   }
   const time = Math.round(durationS);
   const source: PlayLogSource = { playlistId: sourceId, creatorId: options?.creatorId };
-  const play = await weblog(
+  // const play = await weblog(
+  //   cookie,
+  //   "play",
+  //   {
+  //     type: "song",
+  //     wifi: 0,
+  //     download: 0,
+  //     id: String(songId),
+  //     time,
+  //     end: "playend",
+  //     content: playLogContent(songId, source),
+  //     ...playEndSource(songId, source.playlistId),
+  //   },
+  //   "play.end",
+  // );
+  // const ok = Number(play.code) === 200 || play.data === "success";
+  // return { ok, time, message: ok ? "播放上报成功" : JSON.stringify(play) };
+  const pld = await uploadPld(
     cookie,
-    "play",
-    {
-      type: "song",
-      wifi: 0,
-      download: 0,
-      id: String(songId),
-      time,
-      end: "playend",
-      content: playLogContent(songId, source),
-      ...playEndSource(songId, source.playlistId),
-    },
-    "play.end",
+    { id: songId, time },
+    playSource(songId, source.playlistId),
+    time,
   );
-  const ok = Number(play.code) === 200 || play.data === "success";
-  return { ok, time, message: ok ? "播放上报成功" : JSON.stringify(play) };
+  throwIfNcblExpired(pld.status, pld.body);
+  listenLog("pld.end", `id=${songId} time=${time}s creator=${source.creatorId || "-"} ${compactJson(pld.body)}`);
+  const ok = pld.ok;
+  return { ok, time, message: ok ? "播放上报成功" : JSON.stringify(pld.body) };
 }
