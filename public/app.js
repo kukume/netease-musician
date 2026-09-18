@@ -429,6 +429,7 @@ function renderAdmin() {
                 <td>${Number(u.expired) ? `<span class="badge bad">${u.expired}</span>` : 0}</td>
                 <td class="col-actions">
                   <div class="row-actions">
+                    <button class="btn ghost small" data-reset-pw="${escapeHtml(u.id)}" data-reset-name="${escapeHtml(u.username)}">重置密码</button>
                   ${
                     u.id === state.user.id
                       ? ""
@@ -705,6 +706,9 @@ function bindAdmin() {
       toast(e.message, "error");
     }
   };
+  app.querySelectorAll("[data-reset-pw]").forEach((btn) => {
+    btn.onclick = () => resetUserPasswordUi(btn.dataset.resetPw, btn.dataset.resetName || "");
+  });
   app.querySelectorAll("[data-status]").forEach((btn) => {
     btn.onclick = () => patchUserStatus(...btn.dataset.status.split(":"));
   });
@@ -737,6 +741,51 @@ function bindAdmin() {
       state.admin[key] = next;
       await loadAdmin();
     };
+  });
+}
+
+async function resetUserPasswordUi(id, username) {
+  if (!id) return;
+  if (!confirm(`确定重置「${username}」的密码？旧密码将立即失效。`)) return;
+  try {
+    const data = await api(`/api/admin/users/${id}/password`, { method: "POST", body: {} });
+    openResetPasswordModal(data.username || username, data.password || "");
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+function openResetPasswordModal(username, password) {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="modal">
+      <h2>密码已重置</h2>
+      <div class="muted" style="margin-bottom:12px">用户「${escapeHtml(username)}」的新密码只显示一次，请立刻复制发给对方。</div>
+      <label for="reset-pw-value">新密码</label>
+      <div class="sms-row pw-copy">
+        <input id="reset-pw-value" readonly value="${escapeHtml(password)}" />
+        <button type="button" class="btn small" id="copy-reset-pw">复制</button>
+      </div>
+      <button class="btn ghost" type="button" id="close-reset-pw">关闭</button>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  const input = $("#reset-pw-value", wrap);
+  input.focus();
+  input.select();
+  $("#copy-reset-pw", wrap).onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(password);
+      toast("已复制");
+    } catch {
+      input.select();
+      toast(document.execCommand("copy") ? "已复制" : "复制失败，请手动选中", "error");
+    }
+  };
+  $("#close-reset-pw", wrap).onclick = () => wrap.remove();
+  wrap.addEventListener("click", (e) => {
+    if (e.target === wrap) wrap.remove();
   });
 }
 

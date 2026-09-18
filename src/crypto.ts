@@ -15,6 +15,16 @@ export function randomHex(bytes = 16): string {
   return randomBytes(bytes).toString("hex");
 }
 
+const PASSWORD_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+
+export function randomPassword(length = 10): string {
+  const n = Math.max(6, Math.floor(length) || 10);
+  const bytes = randomBytes(n);
+  let out = "";
+  for (let i = 0; i < n; i++) out += PASSWORD_CHARS[bytes[i] % PASSWORD_CHARS.length];
+  return out;
+}
+
 export function md5(text: string): string {
   return createHash("md5").update(text, "utf8").digest("hex");
 }

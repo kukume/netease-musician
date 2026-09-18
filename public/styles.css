@@ -434,6 +434,10 @@ cap-widget {
   margin-top: 0;
   flex-shrink: 0;
 }
+.pw-copy input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.04em;
+}
 .modal textarea {
   min-height: 88px;
   font-size: 12px;

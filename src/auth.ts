@@ -1,4 +1,4 @@
-import { decryptText, encryptText, hashPassword, newId, nowSec, passwordNeedsRehash, randomHex, verifyPassword } from "./crypto";
+import { decryptText, encryptText, hashPassword, newId, nowSec, passwordNeedsRehash, randomHex, randomPassword, verifyPassword } from "./crypto";
 
 export const SESSION_COOKIE = "nl_session";
 const SESSION_DAYS = 7;
@@ -116,4 +116,4 @@ export async function createSession(env: Env, userId: string): Promise<string> {
   return token;
 }
 
-export { hashPassword, verifyPassword, encryptText, decryptText, newId, nowSec, randomHex, passwordNeedsRehash };
+export { hashPassword, verifyPassword, encryptText, decryptText, newId, nowSec, randomHex, randomPassword, passwordNeedsRehash };

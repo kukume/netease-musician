@@ -8,6 +8,7 @@ import {
   newId,
   nowSec,
   ok,
+  randomPassword,
   randomHex,
   parseCookieHeader,
   readJson,
@@ -170,6 +171,9 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     }
 
     if (method === "GET" && path === "/api/admin/users") return adminUsers(env, request);
+    if (method === "POST" && path.startsWith("/api/admin/users/") && path.endsWith("/password")) {
+      return resetUserPassword(env, request, path.slice("/api/admin/users/".length, -"/password".length));
+    }
     if (method === "PATCH" && path.startsWith("/api/admin/users/")) {
       return patchUser(env, request, path.slice("/api/admin/users/".length));
     }
@@ -666,6 +670,26 @@ async function adminUsers(env: Env, request: Request) {
     .bind(pageSize, offset)
     .all();
   return ok({ users: results || [], page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)) });
+}
+
+async function resetUserPassword(env: Env, request: Request, id: string) {
+  const admin = await requireAdmin(env, request);
+  if (admin instanceof Response) return admin;
+  const user = await env.DB.prepare("SELECT id, username FROM users WHERE id = ?")
+    .bind(id)
+    .first<{ id: string; username: string }>();
+  if (!user) return err("用户不存在", 404);
+  const password = randomPassword(10);
+  await env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ?")
+    .bind(hashPassword(password), id)
+    .run();
+  if (id === admin.id) {
+    const token = parseCookieHeader(request, SESSION_COOKIE);
+    await env.DB.prepare("DELETE FROM sessions WHERE user_id = ? AND token != ?").bind(id, token).run();
+  } else {
+    await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  }
+  return ok({ username: user.username, password });
 }
 
 async function patchUser(env: Env, request: Request, id: string) {
