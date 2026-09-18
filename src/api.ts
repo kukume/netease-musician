@@ -31,7 +31,7 @@ import {
   sendSmsCode,
 } from "./netease";
 import { applyPendingMigrations, listMigrations } from "./schema";
-import { getCronHeartbeat, getPlaylistMeta, kickListen, listTracks, onAccountBound, onListenEnabledChange, savePlaylist } from "./listen";
+import { getCronHeartbeat, getPlaylistMeta, listTracks, onAccountBound, onListenEnabledChange, savePlaylist } from "./listen";
 import { qrToSvg } from "./qr";
 import { publicCapConfig, verifyCapToken } from "./cap";
 import {
@@ -185,7 +185,6 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     if (method === "PUT" && path === "/api/admin/playlist") return setPlaylist(env, request);
     if (method === "POST" && path === "/api/admin/playlist/refresh") return refreshPlaylist(env, request);
     if (method === "PUT" && path === "/api/admin/listen") return setListen(env, request);
-    if (method === "POST" && path === "/api/admin/listen/run") return manualListen(env, request);
     if (method === "GET" && path === "/api/admin/migrate") return listDbMigrations(env, request);
     if (method === "POST" && path === "/api/admin/migrate") return runDbMigrations(env, request);
     if (method === "GET" && path === "/api/admin/logs") return adminLogs(env, request);
@@ -391,34 +390,40 @@ async function overview(env: Env, request: Request) {
   if (user instanceof Response) return user;
   const meta = await getPlaylistMeta(env);
   const { page, pageSize, offset } = pageParams(request);
+  const url = new URL(request.url);
+  const accountsPageSize = Math.min(
+    50,
+    Math.max(5, Math.floor(Number(url.searchParams.get("accountsPageSize") || PAGE_SIZE) || PAGE_SIZE)),
+  );
+  let accountsPage = Math.max(1, Math.floor(Number(url.searchParams.get("accountsPage") || 1) || 1));
   const tracksTotal = Number(meta?.track_count || 0);
   const tracks = await listTracks(env, pageSize, offset);
   const now = nowSec();
+  const mine = await env.DB.prepare(
+    `SELECT COUNT(*) as n, SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) as expired
+     FROM netease_accounts WHERE user_id = ?`,
+  )
+    .bind(user.id)
+    .first<{ n: number; expired: number | null }>();
+  const accountsTotal = Number(mine?.n || 0);
+  const accountsTotalPages = Math.max(1, Math.ceil(accountsTotal / accountsPageSize));
+  accountsPage = Math.min(accountsPage, accountsTotalPages);
   const accounts = await env.DB.prepare(
     `SELECT id, netease_uid as neteaseUid, nickname, avatar, status, last_listen_at as lastListenAt, last_error as lastError,
             next_listen_at as nextListenAt, report_at as reportAt, listen_cursor as listenCursor,
             pending_song_id as pendingSongId, pending_song_name as pendingSongName, pending_artist as pendingArtist
-     FROM netease_accounts WHERE user_id = ? ORDER BY created_at DESC`,
+     FROM netease_accounts WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
   )
-    .bind(user.id)
+    .bind(user.id, accountsPageSize, (accountsPage - 1) * accountsPageSize)
     .all();
   const stats = await env.DB.prepare(
-    "SELECT COUNT(*) as bound FROM netease_accounts",
-  ).first<{ bound: number }>();
+    `SELECT COUNT(*) as bound, SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) as expired FROM netease_accounts`,
+  ).first<{ bound: number; expired: number | null }>();
   const listening = await env.DB.prepare(
     "SELECT COUNT(*) as n FROM netease_accounts WHERE pending_song_id IS NOT NULL AND report_at > ?",
   )
     .bind(now)
     .first<{ n: number }>();
-  const current = await env.DB.prepare(
-    `SELECT a.pending_song_id as songId, a.pending_song_name as name, a.pending_artist as artist, t.cover
-     FROM netease_accounts a
-     LEFT JOIN playlist_tracks t ON t.song_id = a.pending_song_id
-     WHERE a.user_id = ? AND a.pending_song_id IS NOT NULL AND a.report_at > ?
-     ORDER BY a.report_at ASC LIMIT 1`,
-  )
-    .bind(user.id, now)
-    .first();
   const cron = await getCronHeartbeat(env);
   return ok({
     playlist: meta
@@ -431,7 +436,6 @@ async function overview(env: Env, request: Request) {
           listenEnabled: !!meta.listen_enabled,
         }
       : null,
-    current,
     cron,
     tracks,
     tracksPage: page,
@@ -439,8 +443,14 @@ async function overview(env: Env, request: Request) {
     tracksTotal,
     tracksTotalPages: Math.max(1, Math.ceil(tracksTotal / pageSize)),
     accounts: accounts.results || [],
+    accountsPage,
+    accountsPageSize,
+    accountsTotal,
+    accountsTotalPages,
+    hasExpired: Number(mine?.expired || 0) > 0,
     boundCount: stats?.bound || 0,
     listeningCount: listening?.n || 0,
+    expiredCount: Number(stats?.expired || 0),
   });
 }
 
@@ -783,13 +793,6 @@ async function setListen(env: Env, request: Request) {
     .run();
   await onListenEnabledChange(env, enabled);
   return ok({ listenEnabled: enabled });
-}
-
-async function manualListen(env: Env, request: Request) {
-  const admin = await requireAdmin(env, request);
-  if (admin instanceof Response) return admin;
-  const result = await kickListen(env);
-  return ok(result);
 }
 
 async function listDbMigrations(env: Env, request: Request) {

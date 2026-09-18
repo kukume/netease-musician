@@ -9,6 +9,9 @@ const state = {
   tracksPage: 1,
   tracksTotal: 0,
   tracksTotalPages: 1,
+  accountsPage: 1,
+  accountsTotal: 0,
+  accountsTotalPages: 1,
   admin: {
     users: [],
     usersPage: 1,
@@ -151,6 +154,16 @@ function coverTag(src, cls = "cover") {
   return `<img class="${cls}" src="${escapeHtml(coverSrc(src))}" alt="" onerror="this.onerror=null;this.src='${DEFAULT_COVER}'" />`;
 }
 
+const ADMIN_LOGS_KEY = "adminLogsCollapsed";
+
+function adminLogsCollapsed() {
+  try {
+    return localStorage.getItem(ADMIN_LOGS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 function pager(kind, page, totalPages, total) {
   return `
     <div class="pager">
@@ -245,7 +258,6 @@ function renderApp() {
   const isAdmin = state.user.role === "admin";
   const o = state.overview || {};
   const playlist = o.playlist || {};
-  const current = o.current || {};
   app.innerHTML = `
     <div class="shell">
       <div class="topbar">
@@ -262,7 +274,7 @@ function renderApp() {
         <button data-view="home" class="${state.view === "home" ? "active" : ""}">我的听歌</button>
         ${isAdmin ? `<button data-view="admin" class="${state.view === "admin" ? "active" : ""}">管理后台</button>` : ""}
       </div>
-      ${state.view === "admin" && isAdmin ? renderAdmin() : renderHome(playlist, current, o)}
+      ${state.view === "admin" && isAdmin ? renderAdmin() : renderHome(playlist, o)}
     </div>
   `;
   bindThemeToggle();
@@ -287,28 +299,21 @@ function renderApp() {
   else stopHomeStatusPoll();
 }
 
-function renderHome(playlist, current, o) {
+function renderHome(playlist, o) {
   const accounts = o.accounts || [];
   const tracks = o.tracks || [];
-  current = current || {};
+  const hasExpired = o.hasExpired || accounts.some((a) => a.status === "expired");
   return `
     <div class="grid">
       <div class="card">
         <h2>${playlist.name ? escapeHtml(playlist.name) : "等待管理员设置歌单"}</h2>
         <div class="muted">${playlist.listenEnabled === false ? "互助听歌已暂停" : "每个账号自己排队开听和上报，时间错开；定时任务只补丢了的闹钟。"}</div>
         <div class="muted" data-cron-status>${escapeHtml(cronStatusText(o.cron))}</div>
-        <div class="nowplay">
-          ${coverTag(current.cover || playlist.cover)}
-          <div>
-            <div class="muted">${current.name ? "你的账号正在听" : "当前没有你的账号在听"}</div>
-            <h3 style="margin:4px 0 0">${escapeHtml(current.name || "等待随机开听")}</h3>
-            <div class="muted">${escapeHtml(current.artist || "")}</div>
-          </div>
-        </div>
         <div class="stats">
           <div class="stat"><span class="muted">歌单曲目</span><b>${playlist.trackCount || 0}</b></div>
           <div class="stat"><span class="muted">已绑定账号</span><b>${o.boundCount || 0}</b></div>
           <div class="stat"><span class="muted">正在听</span><b>${o.listeningCount || 0}</b></div>
+          <div class="stat"><span class="muted">失效账号</span><b>${o.expiredCount || 0}</b></div>
         </div>
         <div style="margin-top:18px">
           <div class="muted">歌曲</div>
@@ -343,7 +348,8 @@ function renderHome(playlist, current, o) {
             </div>`,
             )
             .join("") || `<div class="muted" style="margin-top:12px">还没有绑定账号</div>`}
-          <button class="btn" id="bind">${accounts.some((a) => a.status === "expired") ? "重新登录" : accounts.length ? "继续绑定账号" : "绑定网易云"}</button>
+          ${pager("home-accounts", state.accountsPage || 1, state.accountsTotalPages || 1, state.accountsTotal || 0)}
+          <button class="btn" id="bind">${hasExpired ? "重新登录" : (state.accountsTotal || accounts.length) ? "继续绑定账号" : "绑定网易云"}</button>
         </div>
         <div class="card" style="margin-top:18px">
           <h2>我的听歌记录</h2>
@@ -379,7 +385,6 @@ function renderAdmin() {
         <button class="btn small" type="submit">拉取并保存</button>
         ${p.playlist_id ? `<button class="btn ghost small" id="refresh-playlist" type="button">重新拉取歌单</button>` : ""}
         <button class="btn ghost small" id="toggle-listen" type="button">${p.listen_enabled ? "暂停听歌" : "开启听歌"}</button>
-        <button class="btn ghost small" id="run-now" type="button">立即调度空闲账号</button>
         <button class="btn ghost small" id="run-migrate" type="button">${
           (state.admin.migrate?.pending || []).length
             ? `应用数据库迁移（${state.admin.migrate.pending.length}）`
@@ -403,12 +408,14 @@ function renderAdmin() {
       </div>
       ${pager("tracks", state.admin.tracksPage, state.admin.tracksTotalPages, state.admin.tracksTotal)}
     </div>
-    <div class="grid">
-      <div class="card">
-        <h2>用户管理</h2>
+    <div class="admin-split">
+      <div class="card users-card">
+        <div class="card-head">
+          <h2>用户管理</h2>
+        </div>
         <div class="table-wrap">
         <table class="table">
-          <thead><tr><th>用户</th><th>邮箱</th><th>角色</th><th class="col-center">状态</th><th>绑定</th><th></th></tr></thead>
+          <thead><tr><th>用户</th><th>邮箱</th><th>角色</th><th>状态</th><th>绑定</th><th class="col-actions">操作</th></tr></thead>
           <tbody>
             ${(state.admin.users || [])
               .map(
@@ -417,9 +424,10 @@ function renderAdmin() {
                 <td>${escapeHtml(u.username)}</td>
                 <td>${escapeHtml(u.email || "未绑定")}</td>
                 <td>${u.role === "admin" ? "管理员" : "成员"}</td>
-                <td class="col-center"><span class="badge ${u.status === "active" ? "" : "bad"}">${u.status === "active" ? "正常" : "停用"}</span></td>
+                <td><span class="badge ${u.status === "active" ? "" : "bad"}">${u.status === "active" ? "正常" : "停用"}</span></td>
                 <td>${u.bound}</td>
-                <td class="row-actions">
+                <td class="col-actions">
+                  <div class="row-actions">
                   ${
                     u.id === state.user.id
                       ? ""
@@ -427,6 +435,7 @@ function renderAdmin() {
                     <button class="btn ghost small" data-status="${u.id}:${u.status === "active" ? "disabled" : "active"}">${u.status === "active" ? "停用" : "启用"}</button>
                     <button class="btn ghost small" data-del-user="${u.id}">删除</button>`
                   }
+                  </div>
                 </td>
               </tr>`,
               )
@@ -436,45 +445,56 @@ function renderAdmin() {
         </div>
         ${pager("users", state.admin.usersPage, state.admin.usersTotalPages, state.admin.usersTotal)}
       </div>
-      <div class="card">
-        <h2>邀请码</h2>
-        <button class="btn small" id="new-invite">生成邀请码</button>
-        <div class="table-wrap">
-        <table class="table">
-          <thead><tr><th>邀请码</th><th class="col-center">使用</th><th></th></tr></thead>
-          <tbody>
-            ${(state.admin.invites || [])
-              .map(
-                (i) => `
-              <tr>
-                <td><b>${escapeHtml(i.code)}</b></td>
-                <td class="col-center">${i.usedBy ? escapeHtml(i.usedBy) : '<span class="badge warn">未使用</span>'}</td>
-                <td>${i.usedBy ? "" : `<button class="btn ghost small" data-del-invite="${i.id}">删除</button>`}</td>
-              </tr>`,
-              )
-              .join("")}
-          </tbody>
-        </table>
+      <div class="admin-side">
+        <div class="card invites-card">
+          <div class="card-head">
+            <h2>邀请码</h2>
+            <button class="btn small" id="new-invite">生成邀请码</button>
+          </div>
+          <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>邀请码</th><th>使用</th><th class="col-actions">操作</th></tr></thead>
+            <tbody>
+              ${(state.admin.invites || [])
+                .map(
+                  (i) => `
+                <tr>
+                  <td><b>${escapeHtml(i.code)}</b></td>
+                  <td>${i.usedBy ? escapeHtml(i.usedBy) : '<span class="badge warn">未使用</span>'}</td>
+                  <td class="col-actions">${i.usedBy ? "" : `<div class="row-actions"><button class="btn ghost small" data-del-invite="${i.id}">删除</button></div>`}</td>
+                </tr>`,
+                )
+                .join("")}
+            </tbody>
+          </table>
+          </div>
+          ${pager("invites", state.admin.invitesPage, state.admin.invitesTotalPages, state.admin.invitesTotal)}
         </div>
-        ${pager("invites", state.admin.invitesPage, state.admin.invitesTotalPages, state.admin.invitesTotal)}
+        <div class="card logs-card${adminLogsCollapsed() ? " collapsed" : ""}">
+          <div class="card-head" id="toggle-admin-logs">
+            <h2>全站听歌日志</h2>
+            <button type="button" class="btn ghost small" id="toggle-admin-logs-btn">${adminLogsCollapsed() ? "展开" : "收起"}</button>
+          </div>
+          <div class="logs-body">
+            <div class="logs">
+              ${(state.admin.logs || [])
+                .map(
+                  (l) => `
+                <div class="logline">
+                  <div class="logline-row">
+                    <span class="badge ${l.ok ? "" : "bad"}">${l.ok ? "成功" : "失败"}</span>
+                    <span class="logline-who">${escapeHtml(l.username || "")} / ${escapeHtml(l.nickname || "")}</span>
+                  </div>
+                  <div class="logline-song">${escapeHtml(l.songName || "")}</div>
+                  <div class="logline-meta">${escapeHtml(l.message || "")} · ${fmtTime(l.createdAt)}</div>
+                </div>`,
+                )
+                .join("") || `<div class="muted">暂无记录</div>`}
+            </div>
+            ${pager("logs", state.admin.logsPage, state.admin.logsTotalPages, state.admin.logsTotal)}
+          </div>
+        </div>
       </div>
-    </div>
-    <div class="card" style="margin-top:18px">
-      <h2>全站听歌日志</h2>
-      <div class="logs">
-        ${(state.admin.logs || [])
-          .map(
-            (l) => `
-          <div class="logline">
-            <span class="badge ${l.ok ? "" : "bad"}">${l.ok ? "成功" : "失败"}</span>
-            ${escapeHtml(l.username || "")} / ${escapeHtml(l.nickname || "")}
-            · ${escapeHtml(l.songName || "")}
-            <div>${escapeHtml(l.message || "")} · ${fmtTime(l.createdAt)}</div>
-          </div>`,
-          )
-          .join("") || `<div class="muted">暂无记录</div>`}
-      </div>
-      ${pager("logs", state.admin.logsPage, state.admin.logsTotalPages, state.admin.logsTotal)}
     </div>
   `;
 }
@@ -517,8 +537,8 @@ function tickListenStatus() {
   return reportDue;
 }
 
-function homeTracksUrl() {
-  return `/api/overview?page=${state.tracksPage || 1}&pageSize=15`;
+function homeOverviewUrl() {
+  return `/api/overview?page=${state.tracksPage || 1}&pageSize=15&accountsPage=${state.accountsPage || 1}&accountsPageSize=15`;
 }
 
 function homeLogsUrl() {
@@ -531,6 +551,9 @@ function applyHomePayload(overview, logs) {
   state.tracksPage = overview.tracksPage || 1;
   state.tracksTotal = overview.tracksTotal || 0;
   state.tracksTotalPages = overview.tracksTotalPages || 1;
+  state.accountsPage = overview.accountsPage || 1;
+  state.accountsTotal = overview.accountsTotal || 0;
+  state.accountsTotalPages = overview.accountsTotalPages || 1;
   state.logsPage = logs.page || 1;
   state.logsTotal = logs.total || 0;
   state.logsTotalPages = logs.totalPages || 1;
@@ -540,7 +563,7 @@ async function refreshHomeStatus() {
   if (state.statusBusy || !state.user || state.view !== "home") return;
   state.statusBusy = true;
   try {
-    const [overview, logs] = await Promise.all([api(homeTracksUrl()), api(homeLogsUrl())]);
+    const [overview, logs] = await Promise.all([api(homeOverviewUrl()), api(homeLogsUrl())]);
     if (state.view !== "home") return;
     applyHomePayload(overview, logs);
     const y = window.scrollY;
@@ -576,6 +599,13 @@ function bindHome() {
         const next = dir === "next" ? (state.tracksPage || 1) + 1 : (state.tracksPage || 1) - 1;
         if (next < 1 || next > (state.tracksTotalPages || 1)) return;
         state.tracksPage = next;
+        await loadHome();
+        return;
+      }
+      if (kind === "home-accounts") {
+        const next = dir === "next" ? (state.accountsPage || 1) + 1 : (state.accountsPage || 1) - 1;
+        if (next < 1 || next > (state.accountsTotalPages || 1)) return;
+        state.accountsPage = next;
         await loadHome();
         return;
       }
@@ -631,24 +661,6 @@ function bindAdmin() {
       toast(e.message, "error");
     }
   };
-  $("#run-now").onclick = async () => {
-    const btn = $("#run-now");
-    const prev = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = "正在调度…";
-    try {
-      const data = await api("/api/admin/listen/run", { method: "POST" });
-      toast(
-        data.skipped ||
-          `空闲账号 ${data.scattered || 0} 已排队：本分钟开听 ${data.started || 0}，上报 ${data.reported || 0}`,
-      );
-      await loadAdmin();
-    } catch (e) {
-      toast(e.message, "error");
-      btn.disabled = false;
-      btn.textContent = prev;
-    }
-  };
   const migrateBtn = $("#run-migrate");
   if (migrateBtn) {
     migrateBtn.onclick = async () => {
@@ -665,6 +677,21 @@ function bindAdmin() {
         migrateBtn.disabled = false;
         migrateBtn.textContent = prev;
       }
+    };
+  }
+  const logsHead = $("#toggle-admin-logs");
+  if (logsHead) {
+    logsHead.onclick = () => {
+      const next = !adminLogsCollapsed();
+      try {
+        localStorage.setItem(ADMIN_LOGS_KEY, next ? "1" : "0");
+      } catch {
+        /* ignore */
+      }
+      const card = logsHead.closest(".logs-card");
+      if (card) card.classList.toggle("collapsed", next);
+      const btn = $("#toggle-admin-logs-btn");
+      if (btn) btn.textContent = next ? "展开" : "收起";
     };
   }
   $("#new-invite").onclick = async () => {
@@ -881,12 +908,14 @@ function openPasswordModal() {
 }
 
 function showBindTab(wrap, name) {
+  const prev = wrap.querySelector("[data-bind-tab].active")?.dataset.bindTab;
   wrap.querySelectorAll("[data-bind-tab]").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.bindTab === name);
   });
   wrap.querySelectorAll("[data-bind-panel]").forEach((el) => {
     el.hidden = el.dataset.bindPanel !== name;
   });
+  if (prev === "qr" && name !== "qr") resetQrPanel(wrap);
 }
 
 function openQrModal() {
@@ -897,16 +926,14 @@ function openQrModal() {
     <div class="modal">
       <h2>绑定网易云</h2>
       <div class="tabs">
-        <button type="button" class="tab active" data-bind-tab="qr">扫码</button>
+        <button type="button" class="tab active" data-bind-tab="cookie">Cookie</button>
         <button type="button" class="tab" data-bind-tab="sms">手机验证码</button>
-        <button type="button" class="tab" data-bind-tab="cookie">Cookie</button>
+        <button type="button" class="tab" data-bind-tab="qr">扫码</button>
       </div>
-      <div data-bind-panel="qr">
-        <div class="muted" id="qr-status">正在生成二维码…</div>
-        <div id="qr-section">
-          <div class="qr-box" id="qr-box"></div>
-          <div class="qr-url" id="qr-url"></div>
-        </div>
+      <div data-bind-panel="cookie">
+        <label for="cookie-input">从浏览器复制登录后的 Cookie（需含 MUSIC_U 和 __csrf）</label>
+        <textarea id="cookie-input" rows="4" placeholder="MUSIC_U=...; __csrf=..."></textarea>
+        <button class="btn" id="bind-cookie">用 Cookie 绑定</button>
       </div>
       <div data-bind-panel="sms" hidden>
         <label for="sms-phone">手机号</label>
@@ -918,10 +945,13 @@ function openQrModal() {
         <input id="sms-code" inputmode="numeric" autocomplete="one-time-code" placeholder="短信验证码">
         <button type="button" class="btn" id="sms-login">登录并绑定</button>
       </div>
-      <div data-bind-panel="cookie" hidden>
-        <label for="cookie-input">从浏览器复制登录后的 Cookie（需含 MUSIC_U 和 __csrf）</label>
-        <textarea id="cookie-input" rows="4" placeholder="MUSIC_U=...; __csrf=..."></textarea>
-        <button class="btn" id="bind-cookie">用 Cookie 绑定</button>
+      <div data-bind-panel="qr" hidden>
+        <div class="muted" id="qr-status">点击下方按钮获取登录二维码</div>
+        <div id="qr-section" hidden>
+          <div class="qr-box" id="qr-box"></div>
+          <div class="qr-url" id="qr-url"></div>
+        </div>
+        <button type="button" class="btn" id="qr-fetch">获取二维码</button>
       </div>
       <button class="btn ghost" id="close-qr">关闭</button>
     </div>
@@ -943,7 +973,7 @@ function openQrModal() {
   $("#sms-code", wrap).onkeydown = (e) => {
     if (e.key === "Enter") bindWithSms(wrap);
   };
-  startQr(wrap);
+  $("#qr-fetch", wrap).onclick = () => startQr(wrap);
 }
 
 async function bindWithCookie(wrap) {
@@ -1016,26 +1046,52 @@ async function bindWithSms(wrap) {
   }
 }
 
-function stopQrScan(wrap, message) {
+function resetQrPanel(wrap, message) {
   clearInterval(state.pollTimer);
   state.pollTimer = null;
+  state.qr = null;
   const status = $("#qr-status", wrap);
-  if (status) status.textContent = `${message}。请改用手机验证码或 Cookie`;
-  const active = wrap.querySelector("[data-bind-tab].active");
-  if (!active || active.dataset.bindTab === "qr") showBindTab(wrap, "sms");
-  const phone = $("#sms-phone", wrap);
-  if (phone) phone.focus();
+  if (status) status.textContent = message || "点击下方按钮获取登录二维码";
+  const box = $("#qr-box", wrap);
+  if (box) box.innerHTML = "";
+  const urlEl = $("#qr-url", wrap);
+  if (urlEl) urlEl.textContent = "";
+  const section = $("#qr-section", wrap);
+  if (section) section.hidden = true;
+  const btn = $("#qr-fetch", wrap);
+  if (btn) {
+    btn.hidden = false;
+    btn.disabled = false;
+    btn.textContent = "获取二维码";
+  }
+}
+
+function stopQrScan(wrap, message) {
+  resetQrPanel(wrap, `${message}。可重新获取二维码，或改用手机验证码 / Cookie`);
   toast(message, "error");
 }
 
 async function startQr(wrap) {
+  clearInterval(state.pollTimer);
+  state.pollTimer = null;
+  const btn = $("#qr-fetch", wrap);
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "正在生成…";
+  }
+  const status = $("#qr-status", wrap);
+  if (status) status.textContent = "正在生成二维码…";
   try {
     const data = await api("/api/netease/qrcode", { method: "POST" });
+    if (!wrap.isConnected) return;
     state.qr = data;
     const box = $("#qr-box", wrap);
     if (data.qrSvg) box.innerHTML = data.qrSvg;
     $("#qr-url", wrap).textContent = data.url || "";
     $("#qr-status", wrap).textContent = "请用网易云 App 扫码并确认登录";
+    const section = $("#qr-section", wrap);
+    if (section) section.hidden = false;
+    if (btn) btn.hidden = true;
     let checking = false;
     state.pollTimer = setInterval(async () => {
       if (checking || !wrap.isConnected) return;
@@ -1051,6 +1107,7 @@ async function startQr(wrap) {
           await loadHome();
           return;
         }
+        if (state.qr?.id !== data.id) return;
         if (st.status === "expired" || st.status === "error" || st.status === "verify") {
           stopQrScan(wrap, st.message || "扫码失败");
           return;
@@ -1063,13 +1120,13 @@ async function startQr(wrap) {
       }
     }, 1500);
   } catch (e) {
-    stopQrScan(wrap, e.message);
+    if (wrap.isConnected) stopQrScan(wrap, e.message);
   }
 }
 
 async function loadHome() {
   state.view = "home";
-  const [overview, logs] = await Promise.all([api(homeTracksUrl()), api(homeLogsUrl())]);
+  const [overview, logs] = await Promise.all([api(homeOverviewUrl()), api(homeLogsUrl())]);
   applyHomePayload(overview, logs);
   render();
 }
