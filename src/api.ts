@@ -659,7 +659,8 @@ async function adminUsers(env: Env, request: Request) {
   const total = Number(totalRow?.n || 0);
   const { results } = await env.DB.prepare(
     `SELECT u.id, u.username, u.email, u.role, u.status, u.created_at as createdAt,
-            (SELECT COUNT(*) FROM netease_accounts a WHERE a.user_id = u.id) as bound
+            (SELECT COUNT(*) FROM netease_accounts a WHERE a.user_id = u.id) as bound,
+            (SELECT COUNT(*) FROM netease_accounts a WHERE a.user_id = u.id AND a.status = 'expired') as expired
      FROM users u ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
   )
     .bind(pageSize, offset)

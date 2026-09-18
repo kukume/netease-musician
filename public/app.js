@@ -415,7 +415,7 @@ function renderAdmin() {
         </div>
         <div class="table-wrap">
         <table class="table">
-          <thead><tr><th>用户</th><th>邮箱</th><th>角色</th><th>状态</th><th>绑定</th><th class="col-actions">操作</th></tr></thead>
+          <thead><tr><th>用户</th><th>邮箱</th><th>角色</th><th>状态</th><th>绑定</th><th>失效</th><th class="col-actions">操作</th></tr></thead>
           <tbody>
             ${(state.admin.users || [])
               .map(
@@ -426,6 +426,7 @@ function renderAdmin() {
                 <td>${u.role === "admin" ? "管理员" : "成员"}</td>
                 <td><span class="badge ${u.status === "active" ? "" : "bad"}">${u.status === "active" ? "正常" : "停用"}</span></td>
                 <td>${u.bound}</td>
+                <td>${Number(u.expired) ? `<span class="badge bad">${u.expired}</span>` : 0}</td>
                 <td class="col-actions">
                   <div class="row-actions">
                   ${
