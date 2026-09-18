@@ -583,7 +583,7 @@ function bindHome() {
   if (bindBtn) bindBtn.onclick = openQrModal;
   app.querySelectorAll("[data-unbind]").forEach((btn) => {
     btn.onclick = async () => {
-      if (!confirm("确定解绑这个网易云账号？")) return;
+      if (!(await appConfirm({ title: "解绑账号", message: "确定解绑这个网易云账号？", confirmText: "解绑" }))) return;
       try {
         await api(`/api/netease/accounts/${btn.dataset.unbind}`, { method: "DELETE" });
         toast("已解绑");
@@ -714,7 +714,7 @@ function bindAdmin() {
   });
   app.querySelectorAll("[data-del-user]").forEach((btn) => {
     btn.onclick = async () => {
-      if (!confirm("确定删除该用户？")) return;
+      if (!(await appConfirm({ title: "删除用户", message: "确定删除该用户？", confirmText: "删除" }))) return;
       try {
         await api(`/api/admin/users/${btn.dataset.delUser}`, { method: "DELETE" });
         await loadAdmin();
@@ -746,13 +746,45 @@ function bindAdmin() {
 
 async function resetUserPasswordUi(id, username) {
   if (!id) return;
-  if (!confirm(`确定重置「${username}」的密码？旧密码将立即失效。`)) return;
+  const ok = await appConfirm({
+    title: "重置密码",
+    message: `确定重置「${username}」的密码？旧密码将立即失效。`,
+    confirmText: "重置",
+  });
+  if (!ok) return;
   try {
     const data = await api(`/api/admin/users/${id}/password`, { method: "POST", body: {} });
     openResetPasswordModal(data.username || username, data.password || "");
   } catch (e) {
     toast(e.message, "error");
   }
+}
+
+function appConfirm({ title, message, confirmText = "确定", cancelText = "取消" }) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement("div");
+    wrap.className = "modal-bg";
+    wrap.innerHTML = `
+      <div class="modal">
+        <h2>${escapeHtml(title)}</h2>
+        <div class="muted">${escapeHtml(message)}</div>
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" id="confirm-cancel">${escapeHtml(cancelText)}</button>
+          <button type="button" class="btn" id="confirm-ok">${escapeHtml(confirmText)}</button>
+        </div>
+      </div>
+    `;
+    const finish = (value) => {
+      wrap.remove();
+      resolve(value);
+    };
+    document.body.appendChild(wrap);
+    $("#confirm-ok", wrap).onclick = () => finish(true);
+    $("#confirm-cancel", wrap).onclick = () => finish(false);
+    wrap.addEventListener("click", (e) => {
+      if (e.target === wrap) finish(false);
+    });
+  });
 }
 
 function openResetPasswordModal(username, password) {
@@ -895,7 +927,7 @@ async function verifyEmailUi(wrap) {
 }
 
 async function unbindEmailUi(wrap) {
-  if (!confirm("确定解除绑定该邮箱？")) return;
+  if (!(await appConfirm({ title: "解除邮箱", message: "确定解除绑定该邮箱？", confirmText: "解除绑定" }))) return;
   const btn = $("#email-unbind", wrap);
   btn.disabled = true;
   try {

@@ -407,6 +407,12 @@ cap-widget {
   border-radius: 24px;
   padding: 22px;
 }
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+}
+.modal-actions .btn { margin-top: 0; flex: 1; }
 .or-line {
   display: flex;
   align-items: center;
