@@ -30,8 +30,21 @@ const REPAIR_SCATTER_MAX_SEC = 120;
 const KICK_SCATTER_MAX_SEC = 30;
 const MAX_REPAIR_PER_TICK = 40;
 const HEARTBEAT_KEY = "listen_cron";
+const QUIET_HOURS_KEY = "quiet_hours";
+const PLAYLIST_REFRESH_DAY_KEY = "playlist_refresh_day";
+const SHANGHAI_TZ = "Asia/Shanghai";
 
 export type WakeKind = "start" | "report";
+
+export type QuietHours = {
+  start: string;
+  end: string;
+};
+
+export type QuietHoursPublic = QuietHours & {
+  active: boolean;
+  now: boolean;
+};
 
 export type ListenQueueMessage = {
   type: WakeKind | "audio";
@@ -85,6 +98,125 @@ function reportDelaySec(durationS: number): number {
 
 function clampDelay(sec: number): number {
   return Math.max(0, Math.min(86400, Math.round(sec)));
+}
+
+export function parseClock(raw: string): { text: string; minutes: number } | null {
+  const m = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec((raw || "").trim());
+  if (!m) return null;
+  let hour = Number(m[1]);
+  const minute = Number(m[2]);
+  if (hour === 24) hour = 0;
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return null;
+  }
+  return { text: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`, minutes: hour * 60 + minute };
+}
+
+export function normalizeQuietHours(start?: string, end?: string): QuietHours {
+  const a = parseClock(start || "");
+  const b = parseClock(end || "");
+  if (!a || !b || a.minutes === b.minutes) return { start: "", end: "" };
+  return { start: a.text, end: b.text };
+}
+
+export function isQuietHoursActive(hours: QuietHours): boolean {
+  return Boolean(parseClock(hours.start) && parseClock(hours.end) && hours.start !== hours.end);
+}
+
+function shanghaiDate(at = new Date()): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: SHANGHAI_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(at);
+}
+
+async function getPlaylistRefreshDay(env: Env): Promise<string> {
+  const row = await env.DB.prepare("SELECT value FROM site_settings WHERE key = ?")
+    .bind(PLAYLIST_REFRESH_DAY_KEY)
+    .first<{ value: string }>();
+  return (row?.value || "").trim();
+}
+
+async function markPlaylistRefreshDay(env: Env, day = shanghaiDate()): Promise<void> {
+  await env.DB.prepare("INSERT OR REPLACE INTO site_settings (key, value) VALUES (?, ?)")
+    .bind(PLAYLIST_REFRESH_DAY_KEY, day)
+    .run();
+}
+
+async function refreshPlaylistIfNewDay(env: Env): Promise<void> {
+  const today = shanghaiDate();
+  const last = await getPlaylistRefreshDay(env);
+  if (last === today) return;
+  const meta = await getPlaylistMeta(env);
+  if (!meta?.playlist_id) return;
+  listenLog("playlist.daily", `day=${today} last=${last || "-"} id=${meta.playlist_id}`);
+  const result = await savePlaylist(env, meta.playlist_id);
+  listenLog("playlist.daily.ok", `"${result.name}" tracks=${result.trackCount}`);
+}
+
+export function shanghaiMinutes(at = new Date()): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: SHANGHAI_TZ,
+    hour: "numeric",
+    minute: "numeric",
+    hourCycle: "h23",
+  }).formatToParts(at);
+  let hour = Number(parts.find((p) => p.type === "hour")?.value || 0);
+  const minute = Number(parts.find((p) => p.type === "minute")?.value || 0);
+  if (hour === 24) hour = 0;
+  return hour * 60 + minute;
+}
+
+export function isQuietNow(hours: QuietHours, nowMin = shanghaiMinutes()): boolean {
+  const start = parseClock(hours.start);
+  const end = parseClock(hours.end);
+  if (!start || !end || start.minutes === end.minutes) return false;
+  if (start.minutes < end.minutes) return nowMin >= start.minutes && nowMin < end.minutes;
+  return nowMin >= start.minutes || nowMin < end.minutes;
+}
+
+function secondsUntilQuietEnd(hours: QuietHours, nowMin = shanghaiMinutes()): number {
+  const end = parseClock(hours.end);
+  if (!end) return 60;
+  let deltaMin = end.minutes - nowMin;
+  if (deltaMin <= 0) deltaMin += 24 * 60;
+  return deltaMin * 60;
+}
+
+function delayUntilListenAllowed(hours: QuietHours, fallbackSec: number): number {
+  if (!isQuietNow(hours)) return fallbackSec;
+  return clampDelay(secondsUntilQuietEnd(hours) + randInt(0, 30));
+}
+
+export function quietHoursPublic(hours: QuietHours): QuietHoursPublic {
+  return {
+    start: hours.start,
+    end: hours.end,
+    active: isQuietHoursActive(hours),
+    now: isQuietNow(hours),
+  };
+}
+
+export async function getQuietHours(env: Env): Promise<QuietHours> {
+  const row = await env.DB.prepare("SELECT value FROM site_settings WHERE key = ?")
+    .bind(QUIET_HOURS_KEY)
+    .first<{ value: string }>();
+  try {
+    const value = JSON.parse(row?.value || "{}") as Partial<QuietHours>;
+    return normalizeQuietHours(value.start, value.end);
+  } catch {
+    return { start: "", end: "" };
+  }
+}
+
+export async function saveQuietHours(env: Env, start?: string, end?: string): Promise<QuietHours> {
+  const hours = normalizeQuietHours(start, end);
+  await env.DB.prepare("INSERT OR REPLACE INTO site_settings (key, value) VALUES (?, ?)")
+    .bind(QUIET_HOURS_KEY, JSON.stringify(hours))
+    .run();
+  return hours;
 }
 
 function listenLog(step: string, detail?: string) {
@@ -250,7 +382,8 @@ export async function onAccountBound(
     listenLog("bind.keep", `id=${account.id.slice(0, 8)} 闹钟仍有效，不重新入队`);
     return;
   }
-  await scheduleWake(env, account.id, "start", bindStartDelaySec());
+  const hours = await getQuietHours(env);
+  await scheduleWake(env, account.id, "start", delayUntilListenAllowed(hours, bindStartDelaySec()));
 }
 
 async function notifyCookieExpired(env: Env, accountId: string): Promise<void> {
@@ -322,6 +455,7 @@ export async function savePlaylist(env: Env, input: string): Promise<{ name: str
   }
 
   await env.DB.prepare(`UPDATE netease_accounts SET listen_cursor = 0 WHERE status = 'active'`).run();
+  await markPlaylistRefreshDay(env);
   return { name: info.name, cover: info.cover, trackCount: info.tracks.length };
 }
 
@@ -612,6 +746,13 @@ async function handleStart(env: Env, body: ListenQueueMessage): Promise<QueueAct
     listenLog("start.paused", `${who(account)} 互助听歌已关闭`);
     return "ack";
   }
+  const hours = await getQuietHours(env);
+  if (isQuietNow(hours)) {
+    const delay = delayUntilListenAllowed(hours, nextGapSec());
+    await scheduleWake(env, account.id, "start", delay);
+    listenLog("start.quiet", `${who(account)} 休息时段 ${hours.start}–${hours.end} 延后 ${delay}s`);
+    return "ack";
+  }
   if (!meta.playlist_id || !meta.track_count) {
     listenLog("start.skip", `${who(account)} 尚未设置歌单`);
     return "ack";
@@ -676,13 +817,15 @@ async function handleReport(env: Env, body: ListenQueueMessage, attempts: number
 
   const meta = await getPlaylistMeta(env);
   const listenEnabled = !!meta?.listen_enabled;
+  const hours = await getQuietHours(env);
+  const nextStartDelay = listenEnabled ? delayUntilListenAllowed(hours, nextGapSec()) : 0;
 
   if (Number(account.report_at || 0) <= now - REPORT_STALE_SEC) {
     const message = "上报过期，已跳过";
     listenLog("report.stale", `${who(account)} song=${song.songId} ${song.name}`);
     await writeLog(env, account, song, 0, message);
     await clearPending(env, account.id, { expired: false, message });
-    if (listenEnabled) await scheduleWake(env, account.id, "start", nextGapSec());
+    if (listenEnabled) await scheduleWake(env, account.id, "start", nextStartDelay);
     return "ack";
   }
 
@@ -715,7 +858,7 @@ async function handleReport(env: Env, body: ListenQueueMessage, attempts: number
     )
       .bind(nowSec(), result.ok ? null : result.message.slice(0, 500), account.id)
       .run();
-    if (listenEnabled) await scheduleWake(env, account.id, "start", gap);
+    if (listenEnabled) await scheduleWake(env, account.id, "start", delayUntilListenAllowed(hours, gap));
     else {
       await env.DB.prepare(
         `UPDATE netease_accounts SET wake_kind = NULL, wake_at = 0, wake_token = NULL, next_listen_at = 0 WHERE id = ?`,
@@ -735,7 +878,7 @@ async function handleReport(env: Env, body: ListenQueueMessage, attempts: number
     }
     if (attempts < 3) return "retry";
     await clearPending(env, account.id, { expired: false, message });
-    if (listenEnabled) await scheduleWake(env, account.id, "start", nextGapSec());
+    if (listenEnabled) await scheduleWake(env, account.id, "start", nextStartDelay);
     return "ack";
   }
 }
@@ -826,9 +969,12 @@ async function repairStuckWakes(
   const meta = await getPlaylistMeta(env);
   if (!meta) return { started: 0, reported: 0, leftoverStarts: 0, leftoverReports: 0, skipped: "尚未初始化" };
 
+  const hours = await getQuietHours(env);
+  const quietNow = isQuietNow(hours);
   const now = nowSec();
   const staleBefore = now - Math.max(0, opts.graceSec);
   const scatter = Math.max(1, opts.scatterMax);
+  const startDelay = () => delayUntilListenAllowed(hours, randInt(0, scatter) || bindStartDelaySec());
 
   const dueReports = await env.DB.prepare(
     `SELECT COUNT(*) as n FROM netease_accounts
@@ -872,7 +1018,7 @@ async function repairStuckWakes(
     if (Number(row.report_at || 0) > 0 && Number(row.report_at) <= now - REPORT_STALE_SEC) {
       await clearPending(env, row.id, { expired: false, message: "上报过期，已跳过" });
       if (meta.listen_enabled && meta.playlist_id) {
-        await scheduleWake(env, row.id, "start", delay || bindStartDelaySec());
+        await scheduleWake(env, row.id, "start", startDelay());
         started += 1;
       }
       continue;
@@ -894,7 +1040,7 @@ async function repairStuckWakes(
       ? await stmt.bind(startBudget).all<RepairRow>()
       : await stmt.bind(staleBefore, startBudget).all<RepairRow>();
     for (const row of startRows || []) {
-      await scheduleWake(env, row.id, "start", randInt(0, scatter));
+      await scheduleWake(env, row.id, "start", startDelay());
       started += 1;
     }
   }
@@ -903,6 +1049,7 @@ async function repairStuckWakes(
   const leftoverStarts = Math.max(0, dueStarts - started);
   let skipped: string | undefined;
   if (!meta.listen_enabled) skipped = "互助听歌已关闭（仍会补到期上报）";
+  else if (quietNow) skipped = `休息时段 ${hours.start}–${hours.end}（仍会补到期上报）`;
   else if (!meta.playlist_id || !meta.track_count) skipped = "尚未设置歌单";
   listenLog(
     "repair.done",
@@ -937,6 +1084,12 @@ export async function tickListen(env: Env): Promise<{
   let result = { ...empty, skipped: undefined as string | undefined };
 
   try {
+    try {
+      await refreshPlaylistIfNewDay(env);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      listenLog("playlist.daily.fail", message);
+    }
     const repair = await repairStuckWakes(env, { graceSec: REPAIR_GRACE_SEC, scatterMax: REPAIR_SCATTER_MAX_SEC });
     result = {
       skipped: repair.skipped,
@@ -989,6 +1142,14 @@ export async function recordCronError(env: Env, message: string, wallMs: number)
 export async function onListenEnabledChange(env: Env, enabled: boolean): Promise<void> {
   if (!enabled) return;
   await repairStuckWakes(env, { graceSec: 0, scatterMax: BIND_START_MAX_SEC });
+}
+
+export async function onQuietHoursChange(env: Env): Promise<void> {
+  const meta = await getPlaylistMeta(env);
+  if (!meta?.listen_enabled) return;
+  const hours = await getQuietHours(env);
+  if (isQuietNow(hours)) return;
+  await repairStuckWakes(env, { graceSec: 0, scatterMax: BIND_START_MAX_SEC, forceIdleStarts: true });
 }
 
 export async function kickListen(env: Env): Promise<{

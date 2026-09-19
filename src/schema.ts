@@ -112,6 +112,7 @@ const STATEMENTS = [
   )`,
   `INSERT OR IGNORE INTO site_settings (key, value) VALUES ('listen_work', '{"owner":"","phase":"idle","expiresAt":0}')`,
   `INSERT OR IGNORE INTO site_settings (key, value) VALUES ('listen_cron', '{"at":0,"status":"idle","wallMs":0,"started":0,"reported":0,"leftoverStarts":0,"leftoverReports":0}')`,
+  `INSERT OR IGNORE INTO site_settings (key, value) VALUES ('quiet_hours', '{"start":"","end":""}')`,
   `CREATE TABLE IF NOT EXISTS d1_migrations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE,
@@ -232,6 +233,12 @@ const FILE_MIGRATIONS: { name: string; statements: string[] }[] = [
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       )`,
       "CREATE INDEX IF NOT EXISTS idx_email_verifications_user ON email_verifications(user_id)",
+    ],
+  },
+  {
+    name: "0013_quiet_hours.sql",
+    statements: [
+      `INSERT OR IGNORE INTO site_settings (key, value) VALUES ('quiet_hours', '{"start":"","end":""}')`,
     ],
   },
 ];

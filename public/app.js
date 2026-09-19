@@ -26,6 +26,7 @@ const state = {
     logsTotal: 0,
     logsTotalPages: 1,
     playlist: null,
+    quietHours: { start: "", end: "", active: false, now: false },
     tracks: [],
     tracksPage: 1,
     tracksTotal: 0,
@@ -110,6 +111,52 @@ function cronStatusText(cron) {
       ? `，剩余 ${cron.leftoverStarts || 0} 开听 / ${cron.leftoverReports || 0} 上报留给下轮`
       : "";
   return `定时任务 ${when}正常 · 补漏开听 ${cron.started || 0} / 上报 ${cron.reported || 0} · ${cron.wallMs || 0}ms${extra}`;
+}
+
+function clockPad(n) {
+  return String(n).padStart(2, "0");
+}
+
+function clockParts(value) {
+  const m = /^(\d{1,2}):(\d{2})/.exec(String(value || "").trim());
+  if (!m) return { hour: "", minute: "" };
+  return { hour: clockPad(Number(m[1])), minute: clockPad(Number(m[2])) };
+}
+
+function clockOptions(max, selected) {
+  let html = `<option value="">--</option>`;
+  for (let i = 0; i <= max; i++) {
+    const v = clockPad(i);
+    html += `<option value="${v}"${selected === v ? " selected" : ""}>${v}</option>`;
+  }
+  return html;
+}
+
+function clockSelects(name, value, hourLabel, minuteLabel) {
+  const { hour, minute } = clockParts(value);
+  return `
+    <div class="clock24">
+      <select name="${name}-h" aria-label="${hourLabel}">${clockOptions(23, hour)}</select>
+      <span>:</span>
+      <select name="${name}-m" aria-label="${minuteLabel}">${clockOptions(59, minute)}</select>
+    </div>
+  `;
+}
+
+function clockValue(form, name) {
+  const hour = String(form.querySelector(`[name="${name}-h"]`)?.value || "");
+  const minute = String(form.querySelector(`[name="${name}-m"]`)?.value || "");
+  if (!hour && !minute) return "";
+  return `${hour || "00"}:${minute || "00"}`;
+}
+
+function listenBanner(playlist) {
+  if (!playlist) return "等待管理员设置歌单";
+  if (playlist.listenEnabled === false) return "互助听歌已暂停";
+  const q = playlist.quietHours;
+  if (q?.now) return `现在是休息时段（${q.start}–${q.end}，北京时间），到点再开听`;
+  if (q?.active) return `每天 ${q.start}–${q.end}（北京时间）休息。`;
+  return "";
 }
 
 function listenState(a) {
@@ -303,11 +350,12 @@ function renderHome(playlist, o) {
   const accounts = o.accounts || [];
   const tracks = o.tracks || [];
   const hasExpired = o.hasExpired || accounts.some((a) => a.status === "expired");
+  const banner = listenBanner(playlist);
   return `
     <div class="grid">
       <div class="card">
         <h2>${playlist.name ? escapeHtml(playlist.name) : "等待管理员设置歌单"}</h2>
-        <div class="muted">${playlist.listenEnabled === false ? "互助听歌已暂停" : "每个账号自己排队开听和上报，时间错开；定时任务只补丢了的闹钟。"}</div>
+        ${banner ? `<div class="muted">${escapeHtml(banner)}</div>` : ""}
         <div class="muted" data-cron-status>${escapeHtml(cronStatusText(o.cron))}</div>
         <div class="stats">
           <div class="stat"><span class="muted">歌单曲目</span><b>${playlist.trackCount || 0}</b></div>
@@ -333,7 +381,7 @@ function renderHome(playlist, o) {
       <div>
         <div class="card">
           <h2>网易云账号</h2>
-          <div class="muted">每个账号独立听歌，同一时间只会听一首。登录失效后可扫码、手机验证码或粘贴 Cookie 重新登录。</div>
+          <div class="muted">每个账号独立听歌，同一时间只会听一首。</div>
           ${(accounts || [])
             .map(
               (a) => `
@@ -374,6 +422,7 @@ function renderHome(playlist, o) {
 
 function renderAdmin() {
   const p = state.admin.playlist || {};
+  const q = state.admin.quietHours || {};
   const tracks = state.admin.tracks || [];
   return `
     <div class="card" style="margin-bottom:18px">
@@ -390,6 +439,25 @@ function renderAdmin() {
             ? `应用数据库迁移（${state.admin.migrate.pending.length}）`
             : "应用数据库迁移"
         }</button>
+      </form>
+      <form id="quiet-hours-form" class="quiet-hours">
+        <div>
+          <div class="quiet-label">休息开始</div>
+          ${clockSelects("start", q.start, "开始时", "开始分")}
+        </div>
+        <div>
+          <div class="quiet-label">休息结束</div>
+          ${clockSelects("end", q.end, "结束时", "结束分")}
+        </div>
+        <button class="btn ghost small" type="submit">保存休息时段</button>
+        ${q.active ? `<button class="btn ghost small" id="clear-quiet-hours" type="button">取消休息时段</button>` : ""}
+        <div class="muted hint">${
+          q.active
+            ? q.now
+              ? `当前正在休息（${escapeHtml(q.start)}–${escapeHtml(q.end)}，北京时间），到点再开听。要全天听点「取消休息时段」。`
+              : `每天 ${escapeHtml(q.start)}–${escapeHtml(q.end)}（北京时间）不听。要全天听点「取消休息时段」。`
+            : "北京时间。两端都填才会停。跨天可以，23:00 到 08:00 那种。"
+        }</div>
       </form>
       <div class="nowplay">
         ${coverTag(p.cover)}
@@ -663,6 +731,34 @@ function bindAdmin() {
       toast(e.message, "error");
     }
   };
+  const quietForm = $("#quiet-hours-form");
+  if (quietForm) {
+    quietForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const start = clockValue(quietForm, "start");
+      const end = clockValue(quietForm, "end");
+      try {
+        const data = await api("/api/admin/quiet-hours", { method: "PUT", body: { start, end } });
+        const q = data.quietHours || {};
+        toast(q.active ? `已设置休息时段 ${q.start}–${q.end}` : "已取消休息时段，全天听");
+        await loadAdmin();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+  }
+  const clearQuiet = $("#clear-quiet-hours");
+  if (clearQuiet) {
+    clearQuiet.onclick = async () => {
+      try {
+        await api("/api/admin/quiet-hours", { method: "PUT", body: { start: "", end: "" } });
+        toast("已取消休息时段，全天听");
+        await loadAdmin();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+  }
   const migrateBtn = $("#run-migrate");
   if (migrateBtn) {
     migrateBtn.onclick = async () => {
@@ -1237,6 +1333,7 @@ async function loadAdmin() {
     logsTotal: logs.total || 0,
     logsTotalPages: logs.totalPages || 1,
     playlist: playlist.playlist,
+    quietHours: playlist.quietHours || { start: "", end: "", active: false, now: false },
     cron: playlist.cron,
     migrate: { applied: migrate.applied || [], pending: migrate.pending || [] },
     tracks: playlist.tracks || [],

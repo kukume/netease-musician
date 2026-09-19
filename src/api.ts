@@ -32,7 +32,19 @@ import {
   sendSmsCode,
 } from "./netease";
 import { applyPendingMigrations, listMigrations } from "./schema";
-import { getCronHeartbeat, getPlaylistMeta, listTracks, onAccountBound, onListenEnabledChange, savePlaylist } from "./listen";
+import {
+  getCronHeartbeat,
+  getPlaylistMeta,
+  getQuietHours,
+  listTracks,
+  onAccountBound,
+  onListenEnabledChange,
+  onQuietHoursChange,
+  parseClock,
+  quietHoursPublic,
+  savePlaylist,
+  saveQuietHours,
+} from "./listen";
 import { qrToSvg } from "./qr";
 import { publicCapConfig, verifyCapToken } from "./cap";
 import {
@@ -189,6 +201,7 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
     if (method === "PUT" && path === "/api/admin/playlist") return setPlaylist(env, request);
     if (method === "POST" && path === "/api/admin/playlist/refresh") return refreshPlaylist(env, request);
     if (method === "PUT" && path === "/api/admin/listen") return setListen(env, request);
+    if (method === "PUT" && path === "/api/admin/quiet-hours") return setQuietHoursApi(env, request);
     if (method === "GET" && path === "/api/admin/migrate") return listDbMigrations(env, request);
     if (method === "POST" && path === "/api/admin/migrate") return runDbMigrations(env, request);
     if (method === "GET" && path === "/api/admin/logs") return adminLogs(env, request);
@@ -438,6 +451,7 @@ async function overview(env: Env, request: Request) {
           trackCount: meta.track_count,
           cursor: meta.cursor,
           listenEnabled: !!meta.listen_enabled,
+          quietHours: quietHoursPublic(await getQuietHours(env)),
         }
       : null,
     cron,
@@ -781,6 +795,7 @@ async function adminPlaylist(env: Env, request: Request) {
   const tracks = await listTracks(env, pageSize, offset);
   return ok({
     playlist: meta,
+    quietHours: quietHoursPublic(await getQuietHours(env)),
     cron: await getCronHeartbeat(env),
     tracks,
     page,
@@ -818,6 +833,20 @@ async function setListen(env: Env, request: Request) {
     .run();
   await onListenEnabledChange(env, enabled);
   return ok({ listenEnabled: enabled });
+}
+
+async function setQuietHoursApi(env: Env, request: Request) {
+  const admin = await requireAdmin(env, request);
+  if (admin instanceof Response) return admin;
+  const body = await readJson<{ start?: string; end?: string }>(request);
+  const start = (body.start || "").trim();
+  const end = (body.end || "").trim();
+  if (Boolean(start) !== Boolean(end)) return err("开始和结束都要填，或者都留空（全天听）");
+  if (start && (!parseClock(start) || !parseClock(end))) return err("时间格式不对");
+  if (start && parseClock(start)?.text === parseClock(end)?.text) return err("开始和结束不能相同");
+  const hours = await saveQuietHours(env, start, end);
+  await onQuietHoursChange(env);
+  return ok({ quietHours: quietHoursPublic(hours) });
 }
 
 async function listDbMigrations(env: Env, request: Request) {

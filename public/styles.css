@@ -281,6 +281,34 @@ html[data-theme="light"] .nav button.active { color: var(--text); }
 }
 .card h2 { margin: 0 0 6px; font-size: 20px; }
 .muted { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.quiet-hours {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  align-items: flex-end;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.quiet-hours .quiet-label { font-size: 13px; color: var(--muted); margin: 0 0 6px; }
+.clock24 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.clock24 span { color: var(--muted); font-weight: 600; }
+.clock24 select {
+  width: 72px;
+  border: 1px solid var(--line);
+  background: var(--fill);
+  color: var(--text);
+  border-radius: 14px;
+  padding: 8px 8px 8px 10px;
+  outline: none;
+  font: inherit;
+}
+.clock24 select:focus { border-color: rgba(236,65,65,0.7); }
+.quiet-hours .hint { margin: 0; flex: 1 1 240px; }
 .nowplay {
   display: flex; gap: 16px; align-items: center; margin-top: 18px;
 }
